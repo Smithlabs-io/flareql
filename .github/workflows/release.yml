@@ -78,6 +78,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           path: dist
+          pattern: flareql-*
           merge-multiple: true
 
       - name: Create repo archive
