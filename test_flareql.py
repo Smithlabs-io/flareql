@@ -57,11 +57,15 @@ NUMERIC_FIELDS = {"botScore", "wafAttackScore", "wafSqliAttackScore",
 class FakeAPI:
     """Stands in for flareql.http_json. Routes on URL/query content."""
 
-    def __init__(self, fail_substrings=(), flip_asn=False, zone_result=None):
+    def __init__(self, fail_substrings=(), flip_asn=False, zone_result=None,
+                 gated_datasets=(), gated_fields=(), empty_zones=False):
         self.fail_substrings = tuple(fail_substrings)
         self.flip_asn = flip_asn
         self.zone_result = (zone_result if zone_result is not None
                             else [{"id": ZONE_ID, "name": "smithlabs.io"}])
+        self.gated_datasets = tuple(gated_datasets)
+        self.gated_fields = tuple(gated_fields)
+        self.empty_zones = empty_zones
         self.queries = []
 
     def __call__(self, url, headers, body=None, timeout=60, max_tries=4):
@@ -69,6 +73,21 @@ class FakeAPI:
             return {"result": self.zone_result}
         q = body["query"]
         self.queries.append(q)
+        if self.empty_zones:
+            return {"data": {"viewer": {"zones": []}}}
+        for node in self.gated_datasets:
+            if node in q:
+                return {"data": None, "errors": [{"message":
+                        f"zone '{ZONE_ID}' does not have access to the path. "
+                        "Refer to https://developers.cloudflare.com/analytics/"
+                        "graphql-api/errors/"}]}
+        hits = [(mm.start(), f) for f in self.gated_fields
+                for mm in re.finditer(r"\b" + re.escape(f) + r"\b", q)]
+        if hits:
+            field = min(hits)[1]
+            return {"data": None, "errors": [{"message":
+                    f"zone '{ZONE_ID}' does not have access to the field "
+                    f"'{field.lower()}' from the path"}]}
         for s in self.fail_substrings:
             if s in q:
                 return {"data": None, "errors": [{"message": f"injected failure on {s}"}]}
@@ -599,6 +618,66 @@ class TestWriteCsvs(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             written = m.write_csvs(td, results)
             self.assertEqual([os.path.basename(p) for p in written], ["meta.json"])
+
+
+# ---------------------------------------------------------------- --probe
+
+class TestProbe(unittest.TestCase):
+    def test_full_access_zone(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "probe.json")
+            out, _, fake = run_main(BASE + ["--probe", "--out", path], fake=FakeAPI())
+            with open(path) as fh:
+                report = json.load(fh)
+        self.assertIn("[http] httpRequestsAdaptiveGroups: AVAILABLE", out)
+        self.assertIn("[firewall] firewallEventsAdaptiveGroups: AVAILABLE", out)
+        self.assertNotIn("filters gated", out)
+        self.assertTrue(all(d["status"] == "yes"
+                            for d in report["datasets"]["http"]["dims"].values()))
+        self.assertEqual(sorted(report["datasets"]["http"]["timeseries"]),
+                         sorted(m.TIMESERIES_BUCKETS))
+        # a fully-enabled zone costs exactly 2 queries per dataset
+        self.assertEqual(len(fake.queries), 4)
+
+    def test_gated_zone(self):
+        fake = FakeAPI(
+            gated_datasets=("firewallEventsAdaptiveGroups",),
+            gated_fields=("clientASNDescription", "botScore", "botScoreSrcName",
+                          "ja4", "wafAttackScore", "wafAttackScoreClass",
+                          "wafSqliAttackScore", "wafXssAttackScore",
+                          "wafRceAttackScore"))
+        out, _, _ = run_main(BASE + ["--probe"], fake=fake)
+        self.assertIn("NOT AVAILABLE — plan-gated on this zone", out)
+        self.assertIn("partial (missing clientASNDescription", out)  # asn degrades
+        self.assertIn("no (field not exposed on this zone)", out)    # botscore gone
+        self.assertIn("filters gated:", out)
+        self.assertIn("Legend:", out)
+
+    def test_dataset_unavailable_with_other_error(self):
+        fake = FakeAPI(fail_substrings=("firewallEventsAdaptiveGroups",))
+        out, _, _ = run_main(BASE + ["--probe"], fake=fake)
+        self.assertIn("NOT AVAILABLE — injected failure", out)
+
+    def test_probe_aborts_on_unrecognized_error(self):
+        # availability passes (no dims), but every dimension query fails without
+        # naming a field -> elimination can't proceed
+        fake = FakeAPI(fail_substrings=("dimensions",))
+        out, err, _ = run_main(BASE + ["--probe"], fake=fake)
+        self.assertIn("probe incomplete", out)
+        self.assertIn("probe aborted", err)
+
+    def test_probe_without_zone_access(self):
+        out, _, _ = run_main(BASE + ["--probe"], fake=FakeAPI(empty_zones=True))
+        self.assertIn("token likely lacks", out)
+
+    def test_parse_gated_field_variants(self):
+        self.assertEqual(m.parse_gated_field(
+            "zone 'x' does not have access to the field 'clientasn' from the path"),
+            "clientasn")
+        self.assertEqual(m.parse_gated_field('Cannot query field "ja4" on type "t"'), "ja4")
+        self.assertEqual(m.parse_gated_field('Field "botScore" is not defined by type "f"'),
+                         "botScore")
+        self.assertIsNone(m.parse_gated_field("query quota exceeded"))
 
 
 # ---------------------------------------------------------------- main / CLI

@@ -1,4 +1,4 @@
-# flareql
+git # flareql
 
 **Query Cloudflare analytics like you write WAF rules.**
 
@@ -51,6 +51,31 @@ Note: bot/attack scores exist only on the http dataset — firewall events carry
 IDs and actions instead. For "what happened to scored traffic", use the http dataset's
 `security` dim; use the firewall dataset for rule-ID detail, sliced by ASN/IP/JA4/path.
 
+## `--probe`: what can YOUR zone actually see?
+
+Dataset and field access varies by zone plan and entitlements (firewall events need a
+paid plan; `botscore`/`botsrc`/`ja4` need Bot Management; attack scores need WAF attack
+scoring). Cloudflare publishes no per-plan matrix, and schema introspection can't answer
+this either — introspection reflects everything the *token* can see across all its
+accounts, not what one zone's plan will actually serve, so a field can introspect fine
+yet refuse at query time.
+
+`--probe` therefore checks the only authoritative way: it runs live `limit: 1` queries
+over a 15-minute window and reads the API's refusals, dropping each field the error
+names until a query succeeds. Cost: 2 queries per dataset on a fully-enabled zone,
+plus one per gated field.
+
+```sh
+flareql --zone smithlabs.io --probe                    # human-readable report
+flareql --zone smithlabs.io --probe --out probe.json   # machine-readable
+```
+
+It reports, per dataset: available or plan-gated; each dim as yes / partial (missing a
+secondary field flareql degrades around) / no; which filter fields (`--asn`, `--where`
+names) will work; and which `--timeseries` buckets exist. If a field shows "no" here,
+no token permission change will add it — that's the zone's plan talking. (Token
+problems look different: the probe reports the permission error itself.)
+
 ## Timeframe
 
 - Relative: `--last 6h`, `--last 3d`, `--last 2w` (default `24h`)
@@ -95,6 +120,9 @@ expression and translates it. It combines (AND) with any other filter flags.
 ## Recipes
 
 ```sh
+# First run on a new zone: see what its plan exposes
+./flareql.py --zone smithlabs.io --probe
+
 # Everything, last 3 days, console tables
 ./flareql.py --zone smithlabs.io --last 3d
 

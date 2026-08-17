@@ -38,6 +38,9 @@ Examples:
 
   # Request-rate curve for a slice + CSVs (one per dimension) into a directory
   flareql.py --zone smithlabs.io --last 3d --timeseries 5min --format csv --out ./pull/
+
+  # What can THIS zone's plan actually see? (the schema is personalized per token+zone)
+  flareql.py --zone smithlabs.io --probe
 """
 
 import argparse
@@ -596,6 +599,123 @@ def estimated_requests(row):
     return count
 
 
+# ---------------------------------------------------------------- --probe (capability probing)
+#
+# Cloudflare enforces dataset/field access per zone plan + entitlements at QUERY
+# time and publishes no per-plan matrix. Schema introspection is not authoritative
+# for this: it reflects the token's whole view (a token spanning an Enterprise and
+# a Free account introspects the union), so a field can introspect fine yet refuse
+# at query time. The only reliable check is running real queries and reading the
+# refusals — --probe issues limit-1 queries over a 15-minute window, dropping each
+# field the API names as inaccessible until a query succeeds.
+# Cost: 2 queries per dataset on a fully-enabled zone, +1 per gated field.
+
+_GATED_FIELD_RES = (
+    re.compile(r"does not have access to the field '([^']+)'"),
+    re.compile(r'[Cc]annot query field "([^"]+)"'),
+    re.compile(r'[Ff]ield "([^"]+)" is not defined'),
+)
+
+
+def parse_gated_field(msg):
+    for rx in _GATED_FIELD_RES:
+        m = rx.search(msg)
+        if m:
+            return m.group(1)
+    return None
+
+
+def probe_dataset(headers, zone_id, ds_key, node, timeout):
+    """Execution-probe one dataset. Returns (status, ok_fields, gated_fields, err)
+    where status is one of: ok, unavailable, error."""
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    fmt = "%Y-%m-%dT%H:%M:%SZ"
+    base_flt = {"datetime_geq": (now - timedelta(minutes=15)).strftime(fmt),
+                "datetime_leq": now.strftime(fmt)}
+    q = build_query(zone_id, node, [], base_flt, 1, False, None)
+    data, errors = gql(headers, q, timeout)
+    if errors:
+        return "unavailable", set(), [], "; ".join(e.get("message", "") for e in errors)
+    if extract_rows(data) is None:
+        return "unavailable", set(), [], ("no zones in response — token likely lacks "
+                                          "Analytics:Read on this zone")
+
+    registry = HTTP_DIMS if ds_key == "http" else FIREWALL_DIMS
+    candidates = {f for fields, _title in registry.values() for f in fields}
+    candidates |= {f for f, _secs in TIMESERIES_BUCKETS.values()}
+    # --where-only fields (e.g. method) are valid dimensions too — probe them the same way
+    candidates |= {gf for gf, _typ, dsets in WHERE_FIELDS.values() if ds_key in dsets}
+    active, gated = set(candidates), []
+    while True:
+        q = build_query(zone_id, node, sorted(active), base_flt, 1, False, None)
+        data, errors = gql(headers, q, timeout)
+        if not errors:
+            return "ok", active, gated, None
+        msg = "; ".join(e.get("message", "") for e in errors)
+        name = (parse_gated_field(msg) or "").lower()
+        match = next((f for f in active if f.lower() == name), None)
+        if not match:
+            return "error", active, gated, msg
+        active.remove(match)
+        gated.append(match)
+
+
+def run_probe(headers, zone_id, zone_name, timeout, out_path=None):
+    report = {"zone": zone_name, "zone_id": zone_id, "datasets": {}}
+    print(f"=== flareql probe | {zone_name} ===")
+    for ds_key, node in DATASETS.items():
+        registry = HTTP_DIMS if ds_key == "http" else FIREWALL_DIMS
+        status, ok_fields, gated, err = probe_dataset(headers, zone_id, ds_key, node, timeout)
+        if status == "unavailable":
+            reason = "plan-gated on this zone" if "not have access" in err else err
+            print(f"\n[{ds_key}] {node}: NOT AVAILABLE — {reason}")
+            report["datasets"][ds_key] = {"available": False, "error": err}
+            continue
+        if status == "error":
+            warn(f"[{ds_key}] probe aborted on an unrecognized error: {err}")
+            print(f"\n[{ds_key}] {node}: AVAILABLE (probe incomplete — see warning)")
+            report["datasets"][ds_key] = {"available": True, "error": err,
+                                          "gated_fields": gated}
+            continue
+        print(f"\n[{ds_key}] {node}: AVAILABLE")
+        dims_report = {}
+        width = max(len(k) for k in registry)
+        for dim_key, (fields, _title) in registry.items():
+            missing = [f for f in fields if f not in ok_fields]
+            if not missing:
+                status_key, label = "yes", "yes"
+            elif fields[0] in ok_fields:
+                status_key = "partial"
+                label = f"partial (missing {', '.join(missing)} — flareql degrades automatically)"
+            else:
+                status_key, label = "no", "no (field not exposed on this zone)"
+            dims_report[dim_key] = {"status": status_key, "missing": missing}
+            print(f"  {dim_key.ljust(width)}  {label}")
+        where_report = {name: gf in ok_fields
+                        for name, (gf, _typ, dsets) in WHERE_FIELDS.items()
+                        if ds_key in dsets}
+        ok = sorted(k for k, v in where_report.items() if v)
+        not_ok = sorted(k for k, v in where_report.items() if not v)
+        ts_ok = [k for k, (f, _s) in TIMESERIES_BUCKETS.items() if f in ok_fields]
+        print(f"  filters ok:    {', '.join(ok) or '(none)'}")
+        if not_ok:
+            print(f"  filters gated: {', '.join(not_ok)}")
+        print(f"  timeseries:    {', '.join(ts_ok) or '(none)'}")
+        report["datasets"][ds_key] = {"available": True, "dims": dims_report,
+                                      "filters": where_report, "timeseries": ts_ok,
+                                      "gated_fields": gated}
+    print("\nLegend: results come from live limit-1 queries — schema introspection is not"
+          "\nused because it reflects the token's whole account view, not this zone's plan."
+          "\nNOT AVAILABLE = the zone's plan lacks the dataset (firewall events need a paid"
+          "\nplan). 'no' fields = plan/entitlement gating (botscore/botsrc/ja4 need Bot"
+          "\nManagement; attack scores need WAF attack scoring) — no token permission"
+          "\nchange adds them.")
+    if out_path:
+        with open(out_path, "w") as fh:
+            json.dump(report, fh, indent=2)
+        print(f"\nWrote probe report to {out_path}", file=sys.stderr)
+
+
 # ---------------------------------------------------------------- output
 
 def truncate(field, value):
@@ -712,6 +832,10 @@ def parse_args():
     p.add_argument("--timeseries", choices=list(TIMESERIES_BUCKETS),
                    help="also pull request counts bucketed by time (dashboard 'Request "
                         "rate analysis') — respects all filters")
+    p.add_argument("--probe", action="store_true",
+                   help="introspect the zone's personalized GraphQL schema and report "
+                        "which of flareql's datasets/dims/filters this zone+token can "
+                        "actually use, then exit (--out writes the report as JSON)")
     # filters
     p.add_argument("--bot-score-min", type=int, help="min botScore (http dataset only)")
     p.add_argument("--bot-score-max", type=int, help="max botScore (http dataset only)")
@@ -745,6 +869,10 @@ def main():
     headers = build_headers(args)
     since, until = parse_window(args)
     zone_id, zone_name = resolve_zone(headers, args.zone, args.timeout)
+
+    if args.probe:
+        run_probe(headers, zone_id, zone_name, args.timeout, out_path=args.out)
+        return
 
     dataset_keys = ["http", "firewall"] if args.dataset == "both" else [args.dataset]
     if args.bot_score_min is not None or args.bot_score_max is not None:
