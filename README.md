@@ -1,4 +1,4 @@
-git # flareql
+# flareql
 
 **Query Cloudflare analytics like you write WAF rules.**
 
@@ -51,30 +51,69 @@ Note: bot/attack scores exist only on the http dataset — firewall events carry
 IDs and actions instead. For "what happened to scored traffic", use the http dataset's
 `security` dim; use the firewall dataset for rule-ID detail, sliced by ASN/IP/JA4/path.
 
-## `--probe`: what can YOUR zone actually see?
+## `--inspect`: what can YOUR zone actually see?
 
 Dataset and field access varies by zone plan and entitlements (firewall events need a
 paid plan; `botscore`/`botsrc`/`ja4` need Bot Management; attack scores need WAF attack
-scoring). Cloudflare publishes no per-plan matrix, and schema introspection can't answer
-this either — introspection reflects everything the *token* can see across all its
-accounts, not what one zone's plan will actually serve, so a field can introspect fine
-yet refuse at query time.
+scoring), and so does history retention. Cloudflare publishes no per-plan matrix, and
+schema introspection can't answer this either — introspection reflects everything the
+*token* can see across all its accounts, not what one zone's plan will actually serve.
 
-`--probe` therefore checks the only authoritative way: it runs live `limit: 1` queries
-over a 15-minute window and reads the API's refusals, dropping each field the error
-names until a query succeeds. Cost: 2 queries per dataset on a fully-enabled zone,
-plus one per gated field.
+`--inspect` checks the only authoritative way: it runs live `limit: 1` queries and
+reads the API's refusals, dropping each field the error names until a query succeeds,
+then reads the dataset's `settings` node for plan limits.
 
 ```sh
-flareql --zone smithlabs.io --probe                    # human-readable report
-flareql --zone smithlabs.io --probe --out probe.json   # machine-readable
+flareql --zone smithlabs.io --inspect                    # human-readable report
+flareql --zone smithlabs.io --inspect --out report.json  # also write machine-readable
 ```
 
-It reports, per dataset: available or plan-gated; each dim as yes / partial (missing a
-secondary field flareql degrades around) / no; which filter fields (`--asn`, `--where`
-names) will work; and which `--timeseries` buckets exist. If a field shows "no" here,
-no token permission change will add it — that's the zone's plan talking. (Token
-problems look different: the probe reports the permission error itself.)
+Example output for a free zone:
+
+```
+=== flareql inspect | smithlabs.io | plan: Free Website ===
+
+[http] httpRequestsAdaptiveGroups: AVAILABLE
+  limits:     history: 1d back max | window per query: 1d max | fields per query: 30 | rows per page: 10,000
+  fields exposed on this zone (same names work as --dims, filter flags, and --where):
+    cache           yes
+    country         yes
+    host            yes
+    ip              yes
+    method          yes
+    path            yes
+    status          yes
+    ua              yes
+    asn             no
+    attackclass     no
+    attackscore     no
+    botscore        no
+    botsrc          no
+    ja4             no
+    rce             no
+    security        no
+    securityaction  no
+    sqli            no
+    xss             no
+  timeseries: minute, 5min, 15min, hour, day
+
+[firewall] firewallEventsAdaptiveGroups: NOT AVAILABLE — plan-gated on this zone
+```
+
+Reading it:
+
+- **limits › history** is how far back this zone's plan lets you query — a `--last`
+  beyond it errors (the tool appends a hint pointing back here when that happens).
+- **fields** is one unified list: the same short names drive `--dims`, the filter
+  flags, and `--where`, and a field gated for one is gated for all of them. `partial`
+  means only a secondary field is missing (e.g. ASN names) and flareql degrades
+  automatically. If a name shows under `no`, no token permission change adds it —
+  that's the zone's plan talking. (Token problems look different: inspect reports the
+  permission error itself.)
+- `--inspect` runs standalone: query flags like `--dims`/`--last`/filters are ignored
+  with a warning; `--out` writes the JSON report (`--format csv` doesn't apply).
+
+Cost: 3 queries per dataset on a fully-enabled zone, +1 per gated field.
 
 ## Timeframe
 
@@ -120,8 +159,8 @@ expression and translates it. It combines (AND) with any other filter flags.
 ## Recipes
 
 ```sh
-# First run on a new zone: see what its plan exposes
-./flareql.py --zone smithlabs.io --probe
+# First run on a new zone: see what its plan exposes and how far back it can query
+./flareql.py --zone smithlabs.io --inspect
 
 # Everything, last 3 days, console tables
 ./flareql.py --zone smithlabs.io --last 3d

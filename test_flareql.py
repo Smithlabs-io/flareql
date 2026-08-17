@@ -58,14 +58,17 @@ class FakeAPI:
     """Stands in for flareql.http_json. Routes on URL/query content."""
 
     def __init__(self, fail_substrings=(), flip_asn=False, zone_result=None,
-                 gated_datasets=(), gated_fields=(), empty_zones=False):
+                 gated_datasets=(), gated_fields=(), empty_zones=False,
+                 fail_message=None):
         self.fail_substrings = tuple(fail_substrings)
         self.flip_asn = flip_asn
         self.zone_result = (zone_result if zone_result is not None
-                            else [{"id": ZONE_ID, "name": "smithlabs.io"}])
+                            else [{"id": ZONE_ID, "name": "smithlabs.io",
+                                   "plan": {"name": "Free Website"}}])
         self.gated_datasets = tuple(gated_datasets)
         self.gated_fields = tuple(gated_fields)
         self.empty_zones = empty_zones
+        self.fail_message = fail_message
         self.queries = []
 
     def __call__(self, url, headers, body=None, timeout=60, max_tries=4):
@@ -90,10 +93,19 @@ class FakeAPI:
                     f"'{field.lower()}' from the path"}]}
         for s in self.fail_substrings:
             if s in q:
-                return {"data": None, "errors": [{"message": f"injected failure on {s}"}]}
+                return {"data": None, "errors": [{"message":
+                        self.fail_message or f"injected failure on {s}"}]}
         if self.flip_asn and 'clientAsn: "' in q:
             return {"data": None,
                     "errors": [{"message": "wrong value type for filter field clientAsn"}]}
+        if "settings {" in q:
+            node = ("httpRequestsAdaptiveGroups" if "httpRequestsAdaptiveGroups" in q
+                    else "firewallEventsAdaptiveGroups")
+            requested = re.search(r"settings \{ \w+ \{ ([^}]+) \}", q).group(1).split()
+            full = {"enabled": True, "maxDuration": 2678400, "maxNumberOfFields": 30,
+                    "maxPageSize": 10000, "notOlderThan": 2678400}
+            return {"data": {"viewer": {"zones": [{"settings": {node:
+                    {k: v for k, v in full.items() if k in requested}}}]}}}
         mdim = re.search(r"dimensions \{ ([^}]+) \}", q)
         if not mdim:
             rows = [{"count": 1000, "avg": {"sampleInterval": 10}}]
@@ -260,13 +272,19 @@ class TestHttpJson(unittest.TestCase):
 
 class TestResolveZone(unittest.TestCase):
     def test_hex_id_passthrough(self):
-        self.assertEqual(m.resolve_zone({}, ZONE_ID, 60), (ZONE_ID, ZONE_ID))
+        self.assertEqual(m.resolve_zone({}, ZONE_ID, 60), (ZONE_ID, ZONE_ID, None))
 
     def test_name_found(self):
         fake = FakeAPI()
         with mock.patch.object(m, "http_json", fake):
             self.assertEqual(m.resolve_zone({}, "smithlabs.io", 60),
-                             (ZONE_ID, "smithlabs.io"))
+                             (ZONE_ID, "smithlabs.io", "Free Website"))
+
+    def test_name_found_without_plan(self):
+        fake = FakeAPI(zone_result=[{"id": ZONE_ID, "name": "smithlabs.io"}])
+        with mock.patch.object(m, "http_json", fake):
+            self.assertEqual(m.resolve_zone({}, "smithlabs.io", 60),
+                             (ZONE_ID, "smithlabs.io", None))
 
     def test_name_not_found_lists_zones(self):
         responses = [{"result": []},
@@ -622,62 +640,172 @@ class TestWriteCsvs(unittest.TestCase):
 
 # ---------------------------------------------------------------- --probe
 
-class TestProbe(unittest.TestCase):
+class TestInspect(unittest.TestCase):
     def test_full_access_zone(self):
         with tempfile.TemporaryDirectory() as td:
-            path = os.path.join(td, "probe.json")
-            out, _, fake = run_main(BASE + ["--probe", "--out", path], fake=FakeAPI())
+            path = os.path.join(td, "report.json")
+            out, _, fake = run_main(BASE + ["--inspect", "--out", path], fake=FakeAPI())
             with open(path) as fh:
                 report = json.load(fh)
+        self.assertIn("=== flareql inspect | smithlabs.io | plan: Free Website ===", out)
         self.assertIn("[http] httpRequestsAdaptiveGroups: AVAILABLE", out)
         self.assertIn("[firewall] firewallEventsAdaptiveGroups: AVAILABLE", out)
-        self.assertNotIn("filters gated", out)
-        self.assertTrue(all(d["status"] == "yes"
-                            for d in report["datasets"]["http"]["dims"].values()))
+        self.assertIn("limits:     history: 31d back max | window per query: 31d max"
+                      " | fields per query: 30 | rows per page: 10,000", out)
+        self.assertRegex(out, r"\n    ip\s+yes\n")
+        self.assertRegex(out, r"\n    ua\s+yes\n")
+        self.assertNotRegex(out, r"\n    \S+\s+no\n")
+        self.assertNotIn("partial", out)
+        self.assertEqual(report["plan"], "Free Website")
+        self.assertTrue(all(f["status"] == "yes"
+                            for f in report["datasets"]["http"]["fields"].values()))
         self.assertEqual(sorted(report["datasets"]["http"]["timeseries"]),
                          sorted(m.TIMESERIES_BUCKETS))
-        # a fully-enabled zone costs exactly 2 queries per dataset
-        self.assertEqual(len(fake.queries), 4)
+        # availability + field probe + settings per dataset
+        self.assertEqual(len(fake.queries), 6)
 
-    def test_gated_zone(self):
+    def test_gated_zone_groups_yes_and_no(self):
         fake = FakeAPI(
             gated_datasets=("firewallEventsAdaptiveGroups",),
             gated_fields=("clientASNDescription", "botScore", "botScoreSrcName",
                           "ja4", "wafAttackScore", "wafAttackScoreClass",
                           "wafSqliAttackScore", "wafXssAttackScore",
                           "wafRceAttackScore"))
-        out, _, _ = run_main(BASE + ["--probe"], fake=fake)
+        out, _, _ = run_main(BASE + ["--inspect"], fake=fake)
         self.assertIn("NOT AVAILABLE — plan-gated on this zone", out)
-        self.assertIn("partial (missing clientASNDescription", out)  # asn degrades
-        self.assertIn("no (field not exposed on this zone)", out)    # botscore gone
-        self.assertIn("filters gated:", out)
-        self.assertIn("Legend:", out)
+        self.assertRegex(out, r"\n    asn\s+partial \(missing clientASNDescription")
+        for name in ("attackclass", "attackscore", "botscore", "botsrc", "ja4",
+                     "rce", "sqli", "xss"):
+            self.assertRegex(out, rf"\n    {name}\s+no\n")
+        # grouped: every yes row sits above every no row
+        lines = out.splitlines()
+        yes_rows = [i for i, l in enumerate(lines) if re.fullmatch(r"    \S+\s+yes", l)]
+        no_rows = [i for i, l in enumerate(lines) if re.fullmatch(r"    \S+\s+no", l)]
+        self.assertTrue(yes_rows and no_rows)
+        self.assertLess(max(yes_rows), min(no_rows))
+        self.assertNotIn("no (field not exposed", out)
+        self.assertIn("Notes:", out)
+
+    def test_everything_gated(self):
+        all_fields = ({f for fields, _ in m.HTTP_DIMS.values() for f in fields}
+                      | {f for fields, _ in m.FIREWALL_DIMS.values() for f in fields}
+                      | {f for f, _ in m.TIMESERIES_BUCKETS.values()}
+                      | {gf for gf, _t, _d in m.WHERE_FIELDS.values()})
+        out, _, _ = run_main(BASE + ["--inspect"],
+                             fake=FakeAPI(gated_fields=tuple(all_fields)))
+        self.assertNotRegex(out, r"\n    \S+\s+yes\n")
+        self.assertIn("timeseries: (none)", out)
 
     def test_dataset_unavailable_with_other_error(self):
         fake = FakeAPI(fail_substrings=("firewallEventsAdaptiveGroups",))
-        out, _, _ = run_main(BASE + ["--probe"], fake=fake)
+        out, _, _ = run_main(BASE + ["--inspect"], fake=fake)
         self.assertIn("NOT AVAILABLE — injected failure", out)
 
-    def test_probe_aborts_on_unrecognized_error(self):
+    def test_aborts_on_unrecognized_error(self):
         # availability passes (no dims), but every dimension query fails without
         # naming a field -> elimination can't proceed
         fake = FakeAPI(fail_substrings=("dimensions",))
-        out, err, _ = run_main(BASE + ["--probe"], fake=fake)
-        self.assertIn("probe incomplete", out)
-        self.assertIn("probe aborted", err)
+        out, err, _ = run_main(BASE + ["--inspect"], fake=fake)
+        self.assertIn("inspect incomplete", out)
+        self.assertIn("inspect aborted", err)
 
-    def test_probe_without_zone_access(self):
-        out, _, _ = run_main(BASE + ["--probe"], fake=FakeAPI(empty_zones=True))
+    def test_without_zone_access(self):
+        out, _, _ = run_main(BASE + ["--inspect"], fake=FakeAPI(empty_zones=True))
         self.assertIn("token likely lacks", out)
+
+    def test_settings_unavailable_omits_limits(self):
+        out, _, _ = run_main(BASE + ["--inspect"],
+                             fake=FakeAPI(fail_substrings=("settings",)))
+        self.assertIn("AVAILABLE", out)
+        self.assertNotIn("limits:", out)
+
+    def test_partial_settings_omits_limits_line(self):
+        # all four numeric settings fields gated -> only 'enabled' survives,
+        # so no limits line is printed
+        gated = ("maxDuration", "maxNumberOfFields", "maxPageSize", "notOlderThan")
+        out, _, _ = run_main(BASE + ["--inspect"], fake=FakeAPI(gated_fields=gated))
+        self.assertIn("AVAILABLE", out)
+        self.assertNotIn("limits:", out)
+
+    def test_zone_id_no_plan_header(self):
+        out, _, _ = run_main(["--token", "t", "--zone", ZONE_ID, "--inspect"])
+        self.assertIn(f"=== flareql inspect | {ZONE_ID} ===", out)
+
+    def test_ignored_flags_warn(self):
+        _, err, _ = run_main(BASE + ["--inspect", "--dims", "ip", "--dataset", "http",
+                                     "--timeseries", "hour", "--limit", "10",
+                                     "--last", "3d", "--where", "asn eq 1",
+                                     "--asn", "64496"])
+        self.assertIn("--inspect runs standalone; ignoring: --dims, --dataset, "
+                      "--timeseries, --limit, --last/--from/--to, --where, filter flags",
+                      err)
+
+    def test_explicit_window_flags_also_ignored(self):
+        _, err, _ = run_main(BASE + ["--inspect", "--from", "2026-01-01",
+                                     "--to", "2026-01-02"])
+        self.assertIn("--last/--from/--to", err)
+        _, err, _ = run_main(BASE + ["--inspect", "--to", "2026-01-02"])
+        self.assertIn("--last/--from/--to", err)
+
+    def test_csv_format_warns_and_writes_json(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "report.out")
+            _, err, _ = run_main(BASE + ["--inspect", "--format", "csv", "--out", path])
+            with open(path) as fh:
+                report = json.load(fh)
+        self.assertIn("ignoring --format csv", err)
+        self.assertIn("datasets", report)
+
+    def test_quiet_suppresses_console(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "report.json")
+            out, _, _ = run_main(BASE + ["--inspect", "--quiet", "--out", path])
+            self.assertTrue(os.path.exists(path))
+        self.assertEqual(out, "")
 
     def test_parse_gated_field_variants(self):
         self.assertEqual(m.parse_gated_field(
             "zone 'x' does not have access to the field 'clientasn' from the path"),
             "clientasn")
-        self.assertEqual(m.parse_gated_field('Cannot query field "ja4" on type "t"'), "ja4")
-        self.assertEqual(m.parse_gated_field('Field "botScore" is not defined by type "f"'),
+        self.assertEqual(m.parse_gated_field('Cannot query field "ja4" on type "t"'),
+                         "ja4")
+        self.assertEqual(m.parse_gated_field('Field "botScore" is not defined by "f"'),
                          "botScore")
         self.assertIsNone(m.parse_gated_field("query quota exceeded"))
+
+    def test_fmt_secs(self):
+        self.assertEqual(m.fmt_secs(86400), "1d")
+        self.assertEqual(m.fmt_secs(2678400), "31d")
+        self.assertEqual(m.fmt_secs(3600 * 5), "5h")
+        self.assertEqual(m.fmt_secs(90), "90s")
+
+
+class TestDatasetSettings(unittest.TestCase):
+    ZONES = {"viewer": {"zones": [{"settings": {"httpRequestsAdaptiveGroups":
+             {"enabled": True, "notOlderThan": 86400}}}]}}
+
+    def run_settings(self, side_effects):
+        with mock.patch.object(m, "gql", side_effect=side_effects):
+            return m.get_dataset_settings({}, "Z", "httpRequestsAdaptiveGroups", 60)
+
+    def test_success(self):
+        self.assertEqual(self.run_settings([(self.ZONES, [])])["notOlderThan"], 86400)
+
+    def test_field_elimination_then_success(self):
+        effects = [(None, [{"message": 'Cannot query field "maxPageSize" on "s"'}]),
+                   (self.ZONES, [])]
+        self.assertEqual(self.run_settings(effects)["notOlderThan"], 86400)
+
+    def test_unnamed_error_returns_none(self):
+        self.assertIsNone(self.run_settings([(None, [{"message": "internal error"}])]))
+
+    def test_empty_zones_returns_none(self):
+        self.assertIsNone(self.run_settings([({"viewer": {"zones": []}}, [])]))
+
+    def test_all_fields_eliminated_returns_none(self):
+        effects = [(None, [{"message": f'Cannot query field "{f}" on "s"'}])
+                   for f in m.SETTINGS_FIELDS]
+        self.assertIsNone(self.run_settings(effects))
 
 
 # ---------------------------------------------------------------- main / CLI
@@ -773,6 +901,19 @@ class TestMain(unittest.TestCase):
         _, err, _ = run_main(BASE + ["--dataset", "http", "--dims", "ip",
                                      "--action", "block"])
         self.assertIn("--action", err)
+
+    def test_retention_error_hint(self):
+        fake = FakeAPI(fail_substrings=("httpRequestsAdaptiveGroups",),
+                       fail_message="cannot request data older than 86400s")
+        _, err, _ = run_main(BASE + ["--dataset", "http", "--dims", "ip"], fake=fake)
+        self.assertIn("retention limit", err)
+        self.assertIn("--inspect", err)
+
+    def test_gated_field_hint_on_pull(self):
+        fake = FakeAPI(gated_fields=("botScore",))
+        _, err, _ = run_main(BASE + ["--dataset", "http", "--dims", "botscore"],
+                             fake=fake)
+        self.assertIn("plan/entitlement gating", err)
 
     def test_zone_is_required(self):
         with captured(), self.assertRaises(SystemExit):

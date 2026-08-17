@@ -39,8 +39,8 @@ Examples:
   # Request-rate curve for a slice + CSVs (one per dimension) into a directory
   flareql.py --zone smithlabs.io --last 3d --timeseries 5min --format csv --out ./pull/
 
-  # What can THIS zone's plan actually see? (the schema is personalized per token+zone)
-  flareql.py --zone smithlabs.io --probe
+  # What can THIS zone's plan actually see, and how far back? (plan gating is per zone)
+  flareql.py --zone smithlabs.io --inspect
 """
 
 import argparse
@@ -181,14 +181,16 @@ def gql(headers, query, timeout):
 # ---------------------------------------------------------------- zone lookup
 
 def resolve_zone(headers, zone_arg, timeout):
-    """Return (zone_id, zone_name). Accepts a 32-hex zone ID or a zone name."""
+    """Return (zone_id, zone_name, plan_name). Accepts a 32-hex zone ID or a zone
+    name; plan_name is None when the zone is passed as a bare ID."""
     if re.fullmatch(r"[0-9a-f]{32}", zone_arg):
-        return zone_arg, zone_arg
+        return zone_arg, zone_arg, None
     name = zone_arg
     resp = http_json(f"{API_BASE}/zones?name={urlparse.quote(name)}", headers, timeout=timeout)
     result = resp.get("result") or []
     if result:
-        return result[0]["id"], result[0]["name"]
+        plan = (result[0].get("plan") or {}).get("name")
+        return result[0]["id"], result[0]["name"], plan
     # Not found — list what the token can see to help the user correct the name
     resp = http_json(f"{API_BASE}/zones?per_page=50", headers, timeout=timeout)
     names = ", ".join(z["name"] for z in (resp.get("result") or [])) or "(none visible)"
@@ -599,22 +601,25 @@ def estimated_requests(row):
     return count
 
 
-# ---------------------------------------------------------------- --probe (capability probing)
+# ---------------------------------------------------------------- --inspect (capability probing)
 #
 # Cloudflare enforces dataset/field access per zone plan + entitlements at QUERY
 # time and publishes no per-plan matrix. Schema introspection is not authoritative
 # for this: it reflects the token's whole view (a token spanning an Enterprise and
 # a Free account introspects the union), so a field can introspect fine yet refuse
 # at query time. The only reliable check is running real queries and reading the
-# refusals — --probe issues limit-1 queries over a 15-minute window, dropping each
-# field the API names as inaccessible until a query succeeds.
-# Cost: 2 queries per dataset on a fully-enabled zone, +1 per gated field.
+# refusals — --inspect issues limit-1 queries over a 15-minute window, dropping
+# each field the API names as inaccessible until a query succeeds, then reads the
+# dataset's settings node for plan limits (retention, max window, query caps).
 
 _GATED_FIELD_RES = (
     re.compile(r"does not have access to the field '([^']+)'"),
     re.compile(r'[Cc]annot query field "([^"]+)"'),
     re.compile(r'[Ff]ield "([^"]+)" is not defined'),
 )
+
+SETTINGS_FIELDS = ["enabled", "maxDuration", "maxNumberOfFields", "maxPageSize",
+                   "notOlderThan"]
 
 
 def parse_gated_field(msg):
@@ -625,7 +630,24 @@ def parse_gated_field(msg):
     return None
 
 
-def probe_dataset(headers, zone_id, ds_key, node, timeout):
+def error_hint(err):
+    """Append a plain-language hint to raw API errors users repeatedly hit."""
+    if "older than" in err:
+        return err + " [hint: the zone plan's retention limit — shorten --last; run --inspect to see this zone's limits]"
+    if "does not have access" in err:
+        return err + " [hint: plan/entitlement gating — run --inspect to see what this zone exposes]"
+    return err
+
+
+def fmt_secs(s):
+    if s % 86400 == 0:
+        return f"{s // 86400}d"
+    if s % 3600 == 0:
+        return f"{s // 3600}h"
+    return f"{s}s"
+
+
+def inspect_dataset(headers, zone_id, ds_key, node, timeout):
     """Execution-probe one dataset. Returns (status, ok_fields, gated_fields, err)
     where status is one of: ok, unavailable, error."""
     now = datetime.now(timezone.utc).replace(microsecond=0)
@@ -660,60 +682,101 @@ def probe_dataset(headers, zone_id, ds_key, node, timeout):
         gated.append(match)
 
 
-def run_probe(headers, zone_id, zone_name, timeout, out_path=None):
-    report = {"zone": zone_name, "zone_id": zone_id, "datasets": {}}
-    print(f"=== flareql probe | {zone_name} ===")
+def get_dataset_settings(headers, zone_id, node, timeout):
+    """Fetch the dataset's settings node (plan limits: retention, max window, caps).
+    Degrades field-by-field like the probe; returns a dict or None."""
+    fields = list(SETTINGS_FIELDS)
+    while fields:
+        q = ("{ viewer { zones(filter: {zoneTag: %s}) { settings { %s { %s } } } } }"
+             % (json.dumps(zone_id), node, " ".join(fields)))
+        data, errors = gql(headers, q, timeout)
+        if errors:
+            msg = "; ".join(e.get("message", "") for e in errors)
+            name = (parse_gated_field(msg) or "").lower()
+            match = next((f for f in fields if f.lower() == name), None)
+            if not match:
+                return None
+            fields.remove(match)
+            continue
+        zones = ((data or {}).get("viewer") or {}).get("zones") or []
+        if not zones:
+            return None
+        return (zones[0].get("settings") or {}).get(node)
+    return None
+
+
+def run_inspect(headers, zone_id, zone_name, zone_plan, timeout, out_path=None, quiet=False):
+    def say(line):
+        if not quiet:
+            print(line)
+
+    report = {"zone": zone_name, "zone_id": zone_id, "plan": zone_plan, "datasets": {}}
+    say(f"=== flareql inspect | {zone_name}"
+        + (f" | plan: {zone_plan}" if zone_plan else "") + " ===")
     for ds_key, node in DATASETS.items():
         registry = HTTP_DIMS if ds_key == "http" else FIREWALL_DIMS
-        status, ok_fields, gated, err = probe_dataset(headers, zone_id, ds_key, node, timeout)
+        status, ok_fields, gated, err = inspect_dataset(headers, zone_id, ds_key, node, timeout)
         if status == "unavailable":
             reason = "plan-gated on this zone" if "not have access" in err else err
-            print(f"\n[{ds_key}] {node}: NOT AVAILABLE — {reason}")
+            say(f"\n[{ds_key}] {node}: NOT AVAILABLE — {reason}")
             report["datasets"][ds_key] = {"available": False, "error": err}
             continue
         if status == "error":
-            warn(f"[{ds_key}] probe aborted on an unrecognized error: {err}")
-            print(f"\n[{ds_key}] {node}: AVAILABLE (probe incomplete — see warning)")
+            warn(f"[{ds_key}] inspect aborted on an unrecognized error: {err}")
+            say(f"\n[{ds_key}] {node}: AVAILABLE (inspect incomplete — see warning)")
             report["datasets"][ds_key] = {"available": True, "error": err,
-                                          "gated_fields": gated}
+                                          "gated_graphql_fields": gated}
             continue
-        print(f"\n[{ds_key}] {node}: AVAILABLE")
-        dims_report = {}
-        width = max(len(k) for k in registry)
+        say(f"\n[{ds_key}] {node}: AVAILABLE")
+        settings = get_dataset_settings(headers, zone_id, node, timeout)
+        if settings:
+            parts = []
+            if settings.get("notOlderThan"):
+                parts.append(f"history: {fmt_secs(settings['notOlderThan'])} back max")
+            if settings.get("maxDuration"):
+                parts.append(f"window per query: {fmt_secs(settings['maxDuration'])} max")
+            if settings.get("maxNumberOfFields"):
+                parts.append(f"fields per query: {settings['maxNumberOfFields']}")
+            if settings.get("maxPageSize"):
+                parts.append(f"rows per page: {settings['maxPageSize']:,}")
+            if parts:
+                say("  limits:     " + " | ".join(parts))
+        names, missing_by_name = {}, {}
         for dim_key, (fields, _title) in registry.items():
             missing = [f for f in fields if f not in ok_fields]
-            if not missing:
-                status_key, label = "yes", "yes"
-            elif fields[0] in ok_fields:
-                status_key = "partial"
-                label = f"partial (missing {', '.join(missing)} — flareql degrades automatically)"
-            else:
-                status_key, label = "no", "no (field not exposed on this zone)"
-            dims_report[dim_key] = {"status": status_key, "missing": missing}
-            print(f"  {dim_key.ljust(width)}  {label}")
-        where_report = {name: gf in ok_fields
-                        for name, (gf, _typ, dsets) in WHERE_FIELDS.items()
-                        if ds_key in dsets}
-        ok = sorted(k for k, v in where_report.items() if v)
-        not_ok = sorted(k for k, v in where_report.items() if not v)
+            names[dim_key] = ("yes" if not missing
+                              else "partial" if fields[0] in ok_fields else "no")
+            missing_by_name[dim_key] = missing
+        for wname, (gf, _typ, dsets) in WHERE_FIELDS.items():
+            if ds_key in dsets and wname not in names:
+                names[wname] = "yes" if gf in ok_fields else "no"
+                missing_by_name[wname] = [] if gf in ok_fields else [gf]
+        say("  fields exposed on this zone (same names work as --dims, filter flags, and --where):")
+        width = max(len(n) for n in names)
+        status_rank = {"yes": 0, "partial": 1, "no": 2}
+        for n in sorted(names, key=lambda k: (status_rank[names[k]], k)):
+            label = names[n]
+            if label == "partial":
+                label = (f"partial (missing {', '.join(missing_by_name[n])} "
+                         "— flareql degrades automatically)")
+            say(f"    {n.ljust(width)}  {label}")
         ts_ok = [k for k, (f, _s) in TIMESERIES_BUCKETS.items() if f in ok_fields]
-        print(f"  filters ok:    {', '.join(ok) or '(none)'}")
-        if not_ok:
-            print(f"  filters gated: {', '.join(not_ok)}")
-        print(f"  timeseries:    {', '.join(ts_ok) or '(none)'}")
-        report["datasets"][ds_key] = {"available": True, "dims": dims_report,
-                                      "filters": where_report, "timeseries": ts_ok,
-                                      "gated_fields": gated}
-    print("\nLegend: results come from live limit-1 queries — schema introspection is not"
-          "\nused because it reflects the token's whole account view, not this zone's plan."
-          "\nNOT AVAILABLE = the zone's plan lacks the dataset (firewall events need a paid"
-          "\nplan). 'no' fields = plan/entitlement gating (botscore/botsrc/ja4 need Bot"
-          "\nManagement; attack scores need WAF attack scoring) — no token permission"
-          "\nchange adds them.")
+        say("  timeseries: " + (", ".join(ts_ok) or "(none)"))
+        report["datasets"][ds_key] = {
+            "available": True, "settings": settings,
+            "fields": {n: {"status": names[n], "missing": missing_by_name[n]} for n in names},
+            "timeseries": ts_ok, "gated_graphql_fields": gated,
+        }
+    say("\nNotes: results come from live limit-1 queries (schema introspection reflects the"
+        "\ntoken's whole account view, not this zone's plan, so it can't answer this)."
+        "\nNOT AVAILABLE = the zone's plan lacks the dataset entirely. 'no' fields = plan or"
+        "\nentitlement gating (botscore/botsrc/ja4 need Bot Management; attack scores need"
+        "\nWAF attack scoring) — no token permission change adds them. 'history' is how far"
+        "\nback this zone's plan lets you query; --last beyond it will error.")
     if out_path:
         with open(out_path, "w") as fh:
             json.dump(report, fh, indent=2)
-        print(f"\nWrote probe report to {out_path}", file=sys.stderr)
+        print(f"Wrote inspect report to {out_path}", file=sys.stderr)
 
 
 # ---------------------------------------------------------------- output
@@ -832,10 +895,11 @@ def parse_args():
     p.add_argument("--timeseries", choices=list(TIMESERIES_BUCKETS),
                    help="also pull request counts bucketed by time (dashboard 'Request "
                         "rate analysis') — respects all filters")
-    p.add_argument("--probe", action="store_true",
-                   help="introspect the zone's personalized GraphQL schema and report "
-                        "which of flareql's datasets/dims/filters this zone+token can "
-                        "actually use, then exit (--out writes the report as JSON)")
+    p.add_argument("--inspect", action="store_true",
+                   help="probe the zone with live queries and report which datasets/"
+                        "fields this zone's plan actually exposes, plus its limits "
+                        "(retention, max query window), then exit. Runs standalone — "
+                        "other query flags are ignored (--out writes the report as JSON)")
     # filters
     p.add_argument("--bot-score-min", type=int, help="min botScore (http dataset only)")
     p.add_argument("--bot-score-max", type=int, help="max botScore (http dataset only)")
@@ -867,13 +931,29 @@ def parse_args():
 def main():
     args = parse_args()
     headers = build_headers(args)
-    since, until = parse_window(args)
-    zone_id, zone_name = resolve_zone(headers, args.zone, args.timeout)
+    zone_id, zone_name, zone_plan = resolve_zone(headers, args.zone, args.timeout)
 
-    if args.probe:
-        run_probe(headers, zone_id, zone_name, args.timeout, out_path=args.out)
+    if args.inspect:
+        ignored = [flag for flag, given in (
+            ("--dims", args.dims != "all"),
+            ("--dataset", args.dataset != "both"),
+            ("--timeseries", bool(args.timeseries)),
+            ("--limit", args.limit != 150),
+            ("--last/--from/--to", args.last != "24h" or bool(args.from_ts) or bool(args.to_ts)),
+            ("--where", bool(args.where)),
+            ("filter flags", any(v is not None for v in (
+                args.bot_score_min, args.bot_score_max, args.asn, args.country,
+                args.host, args.path_contains, args.ip, args.ja4, args.action))),
+        ) if given]
+        if ignored:
+            warn("--inspect runs standalone; ignoring: " + ", ".join(ignored))
+        if args.out and args.format == "csv":
+            warn("--inspect reports are JSON; ignoring --format csv")
+        run_inspect(headers, zone_id, zone_name, zone_plan, args.timeout,
+                    out_path=args.out, quiet=args.quiet)
         return
 
+    since, until = parse_window(args)
     dataset_keys = ["http", "firewall"] if args.dataset == "both" else [args.dataset]
     if args.bot_score_min is not None or args.bot_score_max is not None:
         if "http" not in dataset_keys:
@@ -941,7 +1021,7 @@ def main():
             flt = make_filter(ds_key, asn_as_string)
             rows, err = query_grouped(headers, zone_id, node, [], flt, 1, args.timeout)
         if err:
-            warn(f"[{ds_key}] window-total query failed: {err}")
+            warn(f"[{ds_key}] window-total query failed: {error_hint(err)}")
             results["datasets"][ds_key] = {"total": {"error": err}, "dims": {}}
             continue
 
@@ -971,7 +1051,7 @@ def main():
             ts_rows, ts_err = query_grouped(headers, zone_id, node, [tfield], flt,
                                             ts_limit, args.timeout, order_by=f"{tfield}_ASC")
             if ts_err:
-                warn(f"[{ds_key}/timeseries] query failed: {ts_err}")
+                warn(f"[{ds_key}/timeseries] query failed: {error_hint(ts_err)}")
             ds_result["timeseries"] = {"bucket": args.timeseries, "field": tfield,
                                        "bucket_seconds": tsecs,
                                        "rows": ts_rows or [], "error": ts_err}
@@ -983,7 +1063,7 @@ def main():
             rows, err = query_grouped(headers, zone_id, node, fields, flt,
                                       args.limit, args.timeout)
             if err:
-                warn(f"[{ds_key}/{dim_key}] query failed: {err}")
+                warn(f"[{ds_key}/{dim_key}] query failed: {error_hint(err)}")
                 ds_result["dims"][dim_key] = {"title": title, "fields": fields,
                                               "rows": [], "error": err}
                 continue
