@@ -431,6 +431,88 @@ class TestWhereParser(unittest.TestCase):
                 parse(expr)
 
 
+class TestBestEffortPruning(unittest.TestCase):
+    """translate_where_best_effort prunes untranslatable clauses instead of raising."""
+
+    def best_effort(self, expr, ds="http"):
+        return m.translate_where_best_effort(parse(expr), ds, False)
+
+    def test_fully_translatable_no_pruning(self):
+        flt, pruned = self.best_effort('ip eq "1.2.3.4" and botscore lt 30')
+        self.assertEqual(pruned, [])
+        self.assertIn("AND", flt)
+
+    def test_unsupported_func_pruned_from_and_is_superset(self):
+        flt, pruned = self.best_effort(
+            'ip eq "1.2.3.4" and any(http.request.headers["x"][*] eq "s")'
+        )
+        self.assertEqual(len(pruned), 1)
+        self.assertEqual(pruned[0]["effect"], "superset")
+        self.assertIn("any()", pruned[0]["reason"])
+        self.assertEqual(flt, {"clientIP": "1.2.3.4"})
+
+    def test_unsupported_func_pruned_from_or_is_subset(self):
+        _, pruned = self.best_effort(
+            'ip eq "1.2.3.4" or any(http.request.headers["x"][*] eq "s")'
+        )
+        self.assertEqual(pruned[0]["effect"], "subset")
+
+    def test_bracket_field_pruned(self):
+        flt, pruned = self.best_effort(
+            'path eq "/api" and http.request.headers["x-internal"] eq "secret"'
+        )
+        self.assertEqual(len(pruned), 1)
+        self.assertIn("not stored", pruned[0]["reason"])
+        self.assertEqual(flt, {"clientRequestPath": "/api"})
+
+    def test_entire_expression_pruned_returns_none(self):
+        flt, pruned = self.best_effort('any(http.request.headers["x"][*] eq "s")')
+        self.assertIsNone(flt)
+        self.assertEqual(pruned[0]["effect"], "none")
+
+    def test_real_world_mixed_expression(self):
+        expr = ('(ip.src.asnum eq 15169) and (cf.bot_management.verified_bot) and '
+                '(any(http.request.headers["x-internal"][*] eq "abc123"))')
+        flt, pruned = self.best_effort(expr)
+        self.assertEqual(len(pruned), 1)
+        self.assertEqual(pruned[0]["effect"], "superset")
+        self.assertIn("AND", flt)
+
+    def test_cidr_in_list_warns(self):
+        with captured() as (_, err):
+            translate('ip in {"17.241.208.160/27" "10.0.0.1"}')
+        self.assertIn("CIDR", err.getvalue())
+        self.assertIn("exact IPs only", err.getvalue())
+
+    def test_non_cidr_in_list_no_warning(self):
+        with captured() as (_, err):
+            translate('ip in {"1.2.3.4" "5.6.7.8"}')
+        self.assertNotIn("CIDR", err.getvalue())
+
+    def test_best_effort_flag_in_cli(self):
+        fake = FakeAPI()
+        _, err, _ = run_main(
+            BASE + ["--dataset", "http", "--dims", "ip", "--best-effort",
+                    "--where", 'ip eq "1.2.3.4" and any(http.request.headers["x"][*] eq "s")'],
+            fake=fake
+        )
+        self.assertIn("pruned clause", err)
+        self.assertIn("superset", err)
+
+    def test_pruned_clauses_in_json_output(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "out.json")
+            run_main(
+                BASE + ["--dataset", "http", "--dims", "ip", "--best-effort",
+                        "--where", 'ip eq "1.2.3.4" and any(http.request.headers["x"][*] eq "s")',
+                        "--out", path],
+                fake=FakeAPI()
+            )
+            data = json.load(open(path))
+        self.assertIn("pruned_clauses", data["meta"])
+        self.assertEqual(data["meta"]["pruned_clauses"]["http"][0]["effect"], "superset")
+
+
 class TestUnsupportedWirefilterConstrucs(unittest.TestCase):
     """Bracket access and unsupported functions parse into prunable nodes, fail at translation."""
 

@@ -635,7 +635,17 @@ def where_cmp_to_filter(field, op, values, dataset_key, asn_as_string):
         return str(v)
 
     if op in ("in", "notin"):
-        return {f"{gql_field}_{'in' if op == 'in' else 'notin'}": [coerce(v) for v in values]}
+        coerced = [coerce(v) for v in values]
+        if typ == "str":
+            cidr_vals = [str(v) for v in values if re.search(r"/\d{1,2}$", str(v))]
+            if cidr_vals:
+                warn(
+                    f"--where: '{field} in {{...}}' contains CIDR notation "
+                    f"({', '.join(cidr_vals[:3])}{'...' if len(cidr_vals) > 3 else ''}) — "
+                    "the Analytics API matches exact IPs only; CIDR blocks will be passed "
+                    "as literal strings and will match nothing"
+                )
+        return {f"{gql_field}_{'in' if op == 'in' else 'notin'}": coerced}
     v = values[0]
     if op == "eq":
         return {gql_field: coerce(v)}
@@ -678,6 +688,57 @@ def translate_where(node, dataset_key, asn_as_string, negate=False):
     if negate:
         op = OP_NEGATE[op]
     return where_cmp_to_filter(field, op, values, dataset_key, asn_as_string)
+
+
+def translate_where_best_effort(node, dataset_key, asn_as_string):
+    """Like translate_where but prunes untranslatable clauses instead of raising.
+
+    Returns (filter_or_None, pruned) where pruned is a list of dicts:
+      {"clause": str, "reason": str, "effect": "superset"|"subset"|"none"}
+
+    effect describes how pruning distorts the result:
+      "superset" — clause removed from AND; result matches MORE traffic than intended
+      "subset"   — clause removed from OR;  result matches LESS traffic than intended
+      "none"     — entire expression pruned; no where filter applied
+    """
+    pruned = []
+
+    def _t(node, negate, parent_logical):
+        kind = node[0]
+        if kind == "unsupported_func":
+            raise ExprError(
+                f"'{node[1]}()' is a wirefilter function with no Analytics API equivalent — "
+                "the API cannot filter on computed values, array operations, or header contents"
+            )
+        if kind == "not":
+            return _t(node[1], not negate, parent_logical)
+        if kind in ("and", "or"):
+            effective = ("or" if kind == "and" else "and") if negate else kind
+            children = []
+            for child in node[1]:
+                try:
+                    result = _t(child, negate, effective)
+                    if result is not None:
+                        children.append(result)
+                except ExprError as e:
+                    effect = "superset" if effective == "and" else "subset"
+                    pruned.append({"clause": _ast_to_str(child), "reason": str(e),
+                                   "effect": effect})
+            if not children:
+                return None
+            return children[0] if len(children) == 1 else {effective.upper(): children}
+        _, field, op, values = node
+        if negate:
+            op = OP_NEGATE[op]
+        return where_cmp_to_filter(field, op, values, dataset_key, asn_as_string)
+
+    try:
+        result = _t(node, False, None)
+    except ExprError as e:
+        pruned.append({"clause": _ast_to_str(node), "reason": str(e), "effect": "none"})
+        result = None
+
+    return result, pruned
 
 
 # ---------------------------------------------------------------- queries
@@ -1057,6 +1118,11 @@ def parse_args():
     p.add_argument("--out", help="write results to this path (json file, or directory for csv)")
     p.add_argument("--format", choices=["json", "csv"], default="json",
                    help="output format for --out (default json)")
+    p.add_argument("--best-effort", action="store_true",
+                   help="When --where contains clauses the Analytics API cannot express "
+                        "(header access, regex, unsupported functions), prune them and "
+                        "continue with the remaining expression instead of exiting. "
+                        "Pruned clauses are reported in stderr and in JSON output.")
     p.add_argument("--quiet", action="store_true", help="suppress console tables")
     p.add_argument("--timeout", type=int, default=60, help="per-request timeout seconds")
     return p.parse_args()
@@ -1106,11 +1172,24 @@ def main():
         except ExprError as e:
             die(f"--where: {e}")
 
+    all_pruned = {}
+
     def make_filter(ds_key, asn_as_string):
         flt = build_filter(args, ds_key, since, until, asn_as_string)
-        if where_ast is not None:
-            flt = {"AND": [flt, translate_where(where_ast, ds_key, asn_as_string)]}
-        return flt
+        if where_ast is None:
+            return flt
+        if args.best_effort:
+            where_flt, pruned = translate_where_best_effort(where_ast, ds_key, asn_as_string)
+            if pruned:
+                all_pruned[ds_key] = pruned
+                for p in pruned:
+                    warn(f"[{ds_key}] --where: pruned clause ({p['effect']}) — "
+                         f"{p['reason']}: {p['clause']!r}")
+            if where_flt is None:
+                return flt
+            return {"AND": [flt, where_flt]}
+        where_flt = translate_where(where_ast, ds_key, asn_as_string)
+        return {"AND": [flt, where_flt]}
 
     results = {
         "meta": {
@@ -1209,6 +1288,9 @@ def main():
                 print_table(title, fields, rows, total_est, args.limit)
 
         results["datasets"][ds_key] = ds_result
+
+    if all_pruned:
+        results["meta"]["pruned_clauses"] = all_pruned
 
     if args.out:
         if args.format == "csv":
