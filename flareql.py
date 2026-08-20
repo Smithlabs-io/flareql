@@ -173,7 +173,16 @@ def http_json(url, headers, body=None, timeout=60, max_tries=4):
     die(f"exhausted retries: {last_err}")  # pragma: no cover — loop always returns or dies
 
 
+_verbose = False
+
+
+def vprint(msg, **kw):
+    if _verbose:
+        print(msg, file=sys.stderr, **kw)
+
+
 def gql(headers, query, timeout):
+    vprint(f"[gql] {query[:600]}{'…' if len(query) > 600 else ''}")
     payload = http_json(GRAPHQL_URL, headers, body={"query": query}, timeout=timeout)
     return payload.get("data"), payload.get("errors") or []
 
@@ -1118,6 +1127,13 @@ def parse_args():
     p.add_argument("--out", help="write results to this path (json file, or directory for csv)")
     p.add_argument("--format", choices=["json", "csv"], default="json",
                    help="output format for --out (default json)")
+    p.add_argument("-v", "--verbose", action="store_true",
+                   help="Print --where translation (AST, filter object, pruned clauses) and "
+                        "each GraphQL query to stderr before sending. Combine with --dry-run "
+                        "to inspect without making any API calls.")
+    p.add_argument("--dry-run", action="store_true",
+                   help="Parse and translate --where, print verbose output, then exit "
+                        "without making any API calls. Implies --verbose.")
     p.add_argument("--best-effort", action="store_true",
                    help="When --where contains clauses the Analytics API cannot express "
                         "(header access, regex, unsupported functions), prune them and "
@@ -1130,6 +1146,38 @@ def parse_args():
 
 def main():
     args = parse_args()
+    global _verbose
+    _verbose = args.verbose or args.dry_run
+
+    if args.dry_run:
+        since, until = parse_window(args)
+        dataset_keys = ["http", "firewall"] if args.dataset == "both" else [args.dataset]
+        where_ast = None
+        if args.where:
+            try:
+                where_ast = WhereParser(tokenize_where(args.where)).parse()
+            except ExprError as e:
+                die(f"--where: {e}")
+        print(f"[dry-run] window  : {since} → {until}")
+        print(f"[dry-run] datasets: {', '.join(dataset_keys)}")
+        if where_ast:
+            print(f"[dry-run] --where : {args.where}")
+            print(f"[dry-run] AST     : {_ast_to_str(where_ast)}")
+            for ds_key in dataset_keys:
+                asn_as_string = ds_key == "firewall"
+                if args.best_effort:
+                    flt, pruned = translate_where_best_effort(where_ast, ds_key, asn_as_string)
+                    print(f"[dry-run] [{ds_key}] filter (best-effort): {json.dumps(flt)}")
+                    for p in pruned:
+                        print(f"[dry-run] [{ds_key}] pruned ({p['effect']}): {p['clause']!r}")
+                else:
+                    try:
+                        flt = translate_where(where_ast, ds_key, asn_as_string)
+                        print(f"[dry-run] [{ds_key}] filter: {json.dumps(flt)}")
+                    except ExprError as e:
+                        print(f"[dry-run] [{ds_key}] error: {e}")
+        return
+
     headers = build_headers(args)
     zone_id, zone_name, zone_plan = resolve_zone(headers, args.zone, args.timeout)
 
@@ -1171,6 +1219,8 @@ def main():
             where_ast = WhereParser(tokenize_where(args.where)).parse()
         except ExprError as e:
             die(f"--where: {e}")
+        vprint(f"[where] expression : {args.where}")
+        vprint(f"[where] AST        : {_ast_to_str(where_ast)}")
 
     all_pruned = {}
 
@@ -1186,9 +1236,12 @@ def main():
                     warn(f"[{ds_key}] --where: pruned clause ({p['effect']}) — "
                          f"{p['reason']}: {p['clause']!r}")
             if where_flt is None:
+                vprint(f"[where] [{ds_key}] entire expression pruned — no where filter applied")
                 return flt
+            vprint(f"[where] [{ds_key}] translated (best-effort): {json.dumps(where_flt)}")
             return {"AND": [flt, where_flt]}
         where_flt = translate_where(where_ast, ds_key, asn_as_string)
+        vprint(f"[where] [{ds_key}] translated: {json.dumps(where_flt)}")
         return {"AND": [flt, where_flt]}
 
     results = {
