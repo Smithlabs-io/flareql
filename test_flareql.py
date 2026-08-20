@@ -431,6 +431,57 @@ class TestWhereParser(unittest.TestCase):
                 parse(expr)
 
 
+class TestUnsupportedWirefilterConstrucs(unittest.TestCase):
+    """Bracket access and unsupported functions parse into prunable nodes, fail at translation."""
+
+    def test_len_parses_to_unsupported_func_node(self):
+        node = parse('len(http.request.headers["x"]) > 0')
+        self.assertEqual(node, ("unsupported_func", "len"))
+
+    def test_any_parses_to_unsupported_func_node(self):
+        node = parse('any(http.request.headers["x"][*] eq "val")')
+        self.assertEqual(node, ("unsupported_func", "any"))
+
+    def test_unsupported_func_ast_to_str(self):
+        node = parse('any(http.request.headers["x"][*] eq "s")')
+        self.assertEqual(m._ast_to_str(node), "any(...)")
+
+    def test_len_raises_at_translation(self):
+        with self.assertRaises(m.ExprError) as ctx:
+            translate('len(path) > 0')
+        self.assertIn("len()", str(ctx.exception))
+        self.assertIn("no Analytics API equivalent", str(ctx.exception))
+
+    def test_any_raises_at_translation(self):
+        with self.assertRaises(m.ExprError) as ctx:
+            translate('any(http.request.headers["x"][*] eq "val")')
+        self.assertIn("any()", str(ctx.exception))
+        self.assertIn("--best-effort", str(ctx.exception))
+
+    def test_all_raises_at_translation(self):
+        with self.assertRaises(m.ExprError):
+            translate('all(http.request.headers["x"][*] eq "val")')
+
+    def test_lower_raises_at_translation(self):
+        with self.assertRaises(m.ExprError) as ctx:
+            translate('lower(path) eq "bot"')
+        self.assertIn("lower()", str(ctx.exception))
+
+    def test_bracket_access_parses_to_cmp(self):
+        node = parse('http.request.headers["x-custom"] eq "value"')
+        self.assertEqual(node[0], "cmp")
+        self.assertIn("[", node[1])
+
+    def test_bracket_access_raises_at_translation(self):
+        with self.assertRaises(m.ExprError) as ctx:
+            translate('http.request.headers["x-custom"] eq "value"')
+        self.assertIn("not stored in the Analytics dataset", str(ctx.exception))
+
+    def test_bracket_star_access_raises_at_translation(self):
+        with self.assertRaises(m.ExprError):
+            translate('http.request.headers["calibre-test-request"][*] eq "abc"')
+
+
 class TestVerifiedBotField(unittest.TestCase):
     """cf.bot_management.verified_bot / cf.verified_bot boolean field."""
 

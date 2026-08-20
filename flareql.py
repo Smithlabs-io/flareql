@@ -346,6 +346,13 @@ WHERE_ALIASES = {
 KEYWORDS = {"and", "or", "not", "in", "eq", "ne", "lt", "le", "gt", "ge",
             "contains", "matches", "wildcard", "starts_with", "ends_with"}
 
+# wirefilter functions that have no Analytics GraphQL equivalent — detected by name so we
+# can parse them into prunable AST nodes instead of hard-failing at parse time.
+_WIREFILTER_UNSUPPORTED_FUNCS = frozenset({
+    "len", "any", "all", "concat", "lower", "upper",
+    "url_decode", "regex_replace", "to_string", "ip_is_private",
+})
+
 OP_NORMALIZE = {"eq": "eq", "==": "eq", "ne": "neq", "!=": "neq",
                 "lt": "lt", "<": "lt", "le": "leq", "<=": "leq",
                 "gt": "gt", ">": "gt", "ge": "geq", ">=": "geq",
@@ -361,6 +368,7 @@ OP_NEGATE = {"eq": "neq", "neq": "eq", "lt": "geq", "geq": "lt",
 
 _WHERE_TOKEN = re.compile(r"""
     (?P<lparen>\() | (?P<rparen>\)) |
+    (?P<lbracket>\[) | (?P<rbracket>\]) |
     (?P<lbrace>\{) | (?P<rbrace>\}) |
     (?P<comma>,) |
     (?P<op>==|!=|<=|>=|<|>) |
@@ -429,6 +437,40 @@ class WhereParser:
             parts.append(self.parse_unary())
         return parts[0] if len(parts) == 1 else ("and", parts)
 
+    def _consume_paren_group(self):
+        """Consume a balanced (...) group, starting after the opening lparen."""
+        self.advance()  # consume (
+        depth = 1
+        while depth > 0:
+            kind, _ = self.advance()
+            if kind is None:
+                raise ExprError("unclosed '(' in function call")
+            if kind == "lparen":
+                depth += 1
+            elif kind == "rparen":
+                depth -= 1
+
+    def _consume_bracket_as_str(self):
+        """Consume one [...] and return it as a display string (e.g. '[\"key\"]', '[*]')."""
+        self.advance()  # consume [
+        parts, depth = [], 1
+        while depth > 0:
+            kind, val = self.advance()
+            if kind is None:
+                raise ExprError("unclosed '[' in field access")
+            if kind == "lbracket":
+                depth += 1
+                parts.append("[")
+            elif kind == "rbracket":
+                depth -= 1
+                if depth > 0:
+                    parts.append("]")
+            elif kind == "value":
+                parts.append(f'"{val}"')
+            else:
+                parts.append(str(val))
+        return "[" + "".join(parts) + "]"
+
     def parse_unary(self):
         kind, val = self.peek()
         if (kind, val) == ("kw", "not"):
@@ -465,8 +507,31 @@ class WhereParser:
 
     def parse_cmp(self):
         kind, field = self.advance()
+        # wirefilter functions with no Analytics equivalent: any(...), len(...), etc.
+        # Consume the full expression into an unsupported_func node so --best-effort can prune it.
+        if kind == "word" and field.lower() in _WIREFILTER_UNSUPPORTED_FUNCS:
+            if self.peek()[0] == "lparen":
+                self._consume_paren_group()
+                # consume optional trailing operator + value/list
+                nk, nv = self.peek()
+                if nk == "op" or (nk == "kw" and nv in OP_NORMALIZE):
+                    self.advance()
+                    if self.peek()[0] in ("value", "word"):
+                        self.advance()
+                    elif self.peek()[0] in ("lbrace", "lparen"):
+                        opener = self.peek()[0]
+                        closer = "rbrace" if opener == "lbrace" else "rparen"
+                        self.advance()
+                        while self.peek()[0] not in (closer, None):
+                            self.advance()
+                        if self.peek()[0] == closer:
+                            self.advance()
+                return ("unsupported_func", field)
         if kind != "word":
             raise ExprError(f"expected a field name, got {field!r}")
+        # bracket access: http.request.headers["key"][*] — consume into field name string
+        while self.peek()[0] == "lbracket":
+            field += self._consume_bracket_as_str()
         # standalone boolean: cf.bot_management.verified_bot (no operator follows)
         # wirefilter allows bare boolean fields as truthy checks — de-sugar to `field eq true`
         next_kind, next_val = self.peek()
@@ -513,11 +578,31 @@ class WhereParser:
 
 def resolve_where_field(name):
     key = name.lower()
+    if "[" in key:
+        raise ExprError(
+            f"'{name}' uses bracket/array access — individual request headers and "
+            "array fields are not stored in the Analytics dataset (only clientIP, "
+            "clientRequestPath, userAgent, botScore, and similar aggregated dimensions)"
+        )
     key = WHERE_ALIASES.get(key, key)
     if key not in WHERE_FIELDS:
         known = ", ".join(sorted(set(WHERE_FIELDS) | set(WHERE_ALIASES)))
         raise ExprError(f"unknown field '{name}' — known fields: {known}")
     return key
+
+
+def _ast_to_str(node):
+    kind = node[0]
+    if kind == "cmp":
+        _, field, op, values = node
+        val = values[0] if len(values) == 1 else "{" + " ".join(str(v) for v in values) + "}"
+        return f"{field} {op} {val!r}"
+    if kind == "unsupported_func":
+        return f"{node[1]}(...)"
+    if kind == "not":
+        return f"not ({_ast_to_str(node[1])})"
+    sep = f" {kind} "
+    return "(" + sep.join(_ast_to_str(c) for c in node[1]) + ")"
 
 
 def where_cmp_to_filter(field, op, values, dataset_key, asn_as_string):
@@ -577,6 +662,11 @@ def where_cmp_to_filter(field, op, values, dataset_key, asn_as_string):
 
 def translate_where(node, dataset_key, asn_as_string, negate=False):
     kind = node[0]
+    if kind == "unsupported_func":
+        raise ExprError(
+            f"'{node[1]}()' is a wirefilter function with no Analytics API equivalent — "
+            "use --best-effort to run with this clause pruned"
+        )
     if kind == "not":
         return translate_where(node[1], dataset_key, asn_as_string, not negate)
     if kind in ("and", "or"):
