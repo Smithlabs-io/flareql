@@ -431,6 +431,89 @@ class TestWhereParser(unittest.TestCase):
                 parse(expr)
 
 
+class TestWhereFunctionCallSyntax(unittest.TestCase):
+    """starts_with(field, value) / ends_with(field, value) — Cloudflare wirefilter function form."""
+
+    def test_starts_with_basic(self):
+        self.assertEqual(parse('starts_with(path, "/api")'),
+                         ("cmp", "path", "starts", ["/api"]))
+
+    def test_ends_with_basic(self):
+        self.assertEqual(parse('ends_with(path, ".json")'),
+                         ("cmp", "path", "ends", [".json"]))
+
+    def test_starts_with_wirefilter_alias_field(self):
+        node = parse('starts_with(http.request.uri.path, "/users/auth/")')
+        self.assertEqual(node, ("cmp", "http.request.uri.path", "starts", ["/users/auth/"]))
+
+    def test_ends_with_wirefilter_alias_field(self):
+        node = parse('ends_with(http.request.uri.path, "/callback")')
+        self.assertEqual(node, ("cmp", "http.request.uri.path", "ends", ["/callback"]))
+
+    def test_function_call_in_compound_expression(self):
+        expr = ('(starts_with(http.request.uri.path, "/users/auth/") and '
+                '(http.request.uri.path contains "facebook" or '
+                'http.request.uri.path contains "shopify"))')
+        node = parse(expr)
+        self.assertEqual(node[0], "and")
+        self.assertEqual(node[1][0], ("cmp", "http.request.uri.path", "starts", ["/users/auth/"]))
+
+    def test_function_call_mixed_with_infix(self):
+        node = parse('starts_with(path, "/api") or path ends_with ".json"')
+        self.assertEqual(node[0], "or")
+        self.assertEqual(node[1][0][2], "starts")
+        self.assertEqual(node[1][1][2], "ends")
+
+    def test_function_call_with_not(self):
+        node = parse('not starts_with(path, "/api")')
+        self.assertEqual(node, ("not", ("cmp", "path", "starts", ["/api"])))
+
+    def test_starts_with_without_paren_errors(self):
+        with self.assertRaises(m.ExprError) as ctx:
+            parse("starts_with path eq 1")
+        self.assertIn("function", str(ctx.exception).lower())
+
+    def test_starts_with_non_word_field_errors(self):
+        with self.assertRaises(m.ExprError):
+            parse('starts_with("literal", "/api")')
+
+    def test_starts_with_missing_comma_errors(self):
+        with self.assertRaises(m.ExprError):
+            parse('starts_with(path "/api")')
+
+    def test_starts_with_missing_value_errors(self):
+        with self.assertRaises(m.ExprError):
+            parse("starts_with(path, )")
+
+    def test_starts_with_unclosed_paren_errors(self):
+        with self.assertRaises(m.ExprError):
+            parse('starts_with(path, "/api"')
+
+    def test_translate_starts_with_function_call(self):
+        self.assertEqual(translate('starts_with(path, "/api")'),
+                         {"clientRequestPath_like": "/api%"})
+
+    def test_translate_ends_with_function_call(self):
+        self.assertEqual(translate('ends_with(path, ".json")'),
+                         {"clientRequestPath_like": "%.json"})
+
+    def test_translate_with_wirefilter_alias(self):
+        self.assertEqual(translate('starts_with(http.request.uri.path, "/users/auth/")'),
+                         {"clientRequestPath_like": "/users/auth/%"})
+
+    def test_translate_function_call_negated(self):
+        self.assertEqual(translate('not starts_with(path, "/api")'),
+                         {"clientRequestPath_notlike": "/api%"})
+
+    def test_translate_function_call_in_compound(self):
+        expr = ('starts_with(http.request.uri.path, "/users/auth/") and '
+                '(http.request.uri.path contains "facebook" or '
+                'http.request.uri.path contains "shopify")')
+        result = translate(expr)
+        self.assertEqual(result["AND"][0], {"clientRequestPath_like": "/users/auth/%"})
+        self.assertIn("OR", result["AND"][1])
+
+
 class TestWhereTranslate(unittest.TestCase):
     def test_every_operator(self):
         self.assertEqual(translate("asn eq 64496"), {"clientAsn": 64496})

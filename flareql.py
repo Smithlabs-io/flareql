@@ -437,6 +437,27 @@ class WhereParser:
             if self.advance()[0] != "rparen":
                 raise ExprError("missing closing ')'")
             return node
+        # function-call form: starts_with(field, value) / ends_with(field, value)
+        if kind == "kw" and val in ("starts_with", "ends_with"):
+            self.advance()
+            if self.peek()[0] != "lparen":
+                raise ExprError(
+                    f"'{val}' used as a function requires '(' — "
+                    f"or use infix form: field {val} value"
+                )
+            self.advance()  # consume (
+            fkind, field = self.advance()
+            if fkind != "word":
+                raise ExprError(f"expected a field name as first argument to {val}()")
+            if self.advance()[0] != "comma":
+                raise ExprError(f"expected ',' after field name in {val}(field, value)")
+            vkind, value = self.advance()
+            if vkind not in ("word", "value"):
+                raise ExprError(f"expected a string value as second argument to {val}()")
+            if self.advance()[0] != "rparen":
+                raise ExprError(f"expected ')' to close {val}()")
+            op = "starts" if val == "starts_with" else "ends"
+            return ("cmp", field, op, [value])
         return self.parse_cmp()
 
     def parse_cmp(self):
