@@ -320,6 +320,7 @@ WHERE_FIELDS = {
     "rce":      ("wafRceAttackScore", "int", ("http",)),
     "securityaction": ("securityAction", "str", ("http",)),
     "cache":    ("cacheStatus", "str", ("http",)),
+    "verifiedbot": ("verifiedBot", "bool", ("http",)),
     "action":   ("action", "str", ("firewall",)),
     "ruleid":   ("ruleId", "str", ("firewall",)),
 }
@@ -338,6 +339,8 @@ WHERE_ALIASES = {
     "http.request.method": "method",
     "cf.waf.score": "attackscore", "waf.score": "attackscore",
     "cf.waf.score.sqli": "sqli", "cf.waf.score.xss": "xss", "cf.waf.score.rce": "rce",
+    "cf.bot_management.verified_bot": "verifiedbot",
+    "cf.verified_bot": "verifiedbot",
 }
 
 KEYWORDS = {"and", "or", "not", "in", "eq", "ne", "lt", "le", "gt", "ge",
@@ -464,6 +467,17 @@ class WhereParser:
         kind, field = self.advance()
         if kind != "word":
             raise ExprError(f"expected a field name, got {field!r}")
+        # standalone boolean: cf.bot_management.verified_bot (no operator follows)
+        # wirefilter allows bare boolean fields as truthy checks — de-sugar to `field eq true`
+        next_kind, next_val = self.peek()
+        is_operator = (next_kind == "op") or (next_kind == "kw" and next_val in OP_NORMALIZE)
+        if not is_operator:
+            try:
+                canon = resolve_where_field(field)
+                if WHERE_FIELDS[canon][1] == "bool":
+                    return ("cmp", field, "eq", ["true"])
+            except ExprError:
+                pass
         kind, op = self.advance()
         if kind == "op" or (kind == "kw" and op in OP_NORMALIZE):
             op = OP_NORMALIZE[op]
@@ -517,6 +531,12 @@ def where_cmp_to_filter(field, op, values, dataset_key, asn_as_string):
         raise ExprError(f"field '{field}' doesn't exist on the {dataset_key} dataset{hint}")
 
     def coerce(v):
+        if typ == "bool":
+            if str(v).lower() in ("true", "1"):
+                return True
+            if str(v).lower() in ("false", "0"):
+                return False
+            raise ExprError(f"'{field}' is a boolean field — use 'true' or 'false', got {v!r}")
         if typ == "asn":
             v = re.sub(r"(?i)^as", "", str(v))
             if not v.isdigit():
@@ -535,6 +555,9 @@ def where_cmp_to_filter(field, op, values, dataset_key, asn_as_string):
     if op == "eq":
         return {gql_field: coerce(v)}
     if op == "neq":
+        # boolean fields: flip the value instead of using _neq (API doesn't support it for bools)
+        if typ == "bool":
+            return {gql_field: not coerce(v)}
         return {f"{gql_field}_neq": coerce(v)}
     if op in ("lt", "leq", "gt", "geq"):
         if typ == "str":
