@@ -431,6 +431,44 @@ class TestWhereParser(unittest.TestCase):
                 parse(expr)
 
 
+class TestVerifiedBotField(unittest.TestCase):
+    """cf.bot_management.verified_bot / cf.verified_bot boolean field."""
+
+    def test_infix_true(self):
+        self.assertEqual(translate("cf.bot_management.verified_bot eq true"),
+                         {"verifiedBot": True})
+
+    def test_infix_false(self):
+        self.assertEqual(translate("cf.bot_management.verified_bot eq false"),
+                         {"verifiedBot": False})
+
+    def test_short_alias(self):
+        self.assertEqual(translate("cf.verified_bot eq true"), {"verifiedBot": True})
+
+    def test_standalone_truthy(self):
+        node = parse("cf.bot_management.verified_bot")
+        self.assertEqual(node, ("cmp", "cf.bot_management.verified_bot", "eq", ["true"]))
+        self.assertEqual(translate("cf.bot_management.verified_bot"), {"verifiedBot": True})
+
+    def test_negated_standalone(self):
+        self.assertEqual(translate("not cf.bot_management.verified_bot"),
+                         {"verifiedBot": False})
+
+    def test_negated_infix(self):
+        self.assertEqual(translate("not cf.bot_management.verified_bot eq true"),
+                         {"verifiedBot": False})
+
+    def test_in_compound(self):
+        result = translate("cf.bot_management.verified_bot and ip.geoip.asnum eq 15169")
+        self.assertIn("AND", result)
+        self.assertIn({"verifiedBot": True}, result["AND"])
+
+    def test_bad_value_errors(self):
+        with self.assertRaises(m.ExprError) as ctx:
+            translate("cf.bot_management.verified_bot eq maybe")
+        self.assertIn("boolean field", str(ctx.exception))
+
+
 class TestWhereFunctionCallSyntax(unittest.TestCase):
     """starts_with(field, value) / ends_with(field, value) — Cloudflare wirefilter function form."""
 
