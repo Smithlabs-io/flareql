@@ -431,6 +431,302 @@ class TestWhereParser(unittest.TestCase):
                 parse(expr)
 
 
+class TestBestEffortPruning(unittest.TestCase):
+    """translate_where_best_effort prunes untranslatable clauses instead of raising."""
+
+    def best_effort(self, expr, ds="http"):
+        return m.translate_where_best_effort(parse(expr), ds, False)
+
+    def test_fully_translatable_no_pruning(self):
+        flt, pruned = self.best_effort('ip eq "1.2.3.4" and botscore lt 30')
+        self.assertEqual(pruned, [])
+        self.assertIn("AND", flt)
+
+    def test_unsupported_func_pruned_from_and_is_superset(self):
+        flt, pruned = self.best_effort(
+            'ip eq "1.2.3.4" and any(http.request.headers["x"][*] eq "s")'
+        )
+        self.assertEqual(len(pruned), 1)
+        self.assertEqual(pruned[0]["effect"], "superset")
+        self.assertIn("any()", pruned[0]["reason"])
+        self.assertEqual(flt, {"clientIP": "1.2.3.4"})
+
+    def test_unsupported_func_pruned_from_or_is_subset(self):
+        _, pruned = self.best_effort(
+            'ip eq "1.2.3.4" or any(http.request.headers["x"][*] eq "s")'
+        )
+        self.assertEqual(pruned[0]["effect"], "subset")
+
+    def test_bracket_field_pruned(self):
+        flt, pruned = self.best_effort(
+            'path eq "/api" and http.request.headers["x-internal"] eq "secret"'
+        )
+        self.assertEqual(len(pruned), 1)
+        self.assertIn("not stored", pruned[0]["reason"])
+        self.assertEqual(flt, {"clientRequestPath": "/api"})
+
+    def test_entire_expression_pruned_returns_none(self):
+        flt, pruned = self.best_effort('any(http.request.headers["x"][*] eq "s")')
+        self.assertIsNone(flt)
+        self.assertEqual(pruned[0]["effect"], "none")
+
+    def test_not_wraps_translatable_clause(self):
+        flt, pruned = self.best_effort('not (asn eq 1)')
+        self.assertEqual(pruned, [])
+        self.assertEqual(flt, {"clientAsn_neq": 1})
+
+    def test_and_fully_pruned_returns_none(self):
+        flt, pruned = self.best_effort('any(x) eq 1 and len(y) eq 1')
+        self.assertIsNone(flt)
+        self.assertEqual(len(pruned), 2)
+        self.assertTrue(all(p["effect"] == "superset" for p in pruned))
+
+    def test_real_world_mixed_expression(self):
+        expr = ('(ip.src.asnum eq 15169) and (cf.bot_management.verified_bot) and '
+                '(any(http.request.headers["x-internal"][*] eq "abc123"))')
+        flt, pruned = self.best_effort(expr)
+        self.assertEqual(len(pruned), 1)
+        self.assertEqual(pruned[0]["effect"], "superset")
+        self.assertIn("AND", flt)
+
+    def test_cidr_in_list_warns(self):
+        with captured() as (_, err):
+            translate('ip in {"17.241.208.160/27" "10.0.0.1"}')
+        self.assertIn("CIDR", err.getvalue())
+        self.assertIn("exact IPs only", err.getvalue())
+
+    def test_non_cidr_in_list_no_warning(self):
+        with captured() as (_, err):
+            translate('ip in {"1.2.3.4" "5.6.7.8"}')
+        self.assertNotIn("CIDR", err.getvalue())
+
+    def test_best_effort_flag_in_cli(self):
+        fake = FakeAPI()
+        _, err, _ = run_main(
+            BASE + ["--dataset", "http", "--dims", "ip", "--best-effort",
+                    "--where", 'ip eq "1.2.3.4" and any(http.request.headers["x"][*] eq "s")'],
+            fake=fake
+        )
+        self.assertIn("pruned clause", err)
+        self.assertIn("superset", err)
+
+    def test_pruned_clauses_in_json_output(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "out.json")
+            run_main(
+                BASE + ["--dataset", "http", "--dims", "ip", "--best-effort",
+                        "--where", 'ip eq "1.2.3.4" and any(http.request.headers["x"][*] eq "s")',
+                        "--out", path],
+                fake=FakeAPI()
+            )
+            data = json.load(open(path))
+        self.assertIn("pruned_clauses", data["meta"])
+        self.assertEqual(data["meta"]["pruned_clauses"]["http"][0]["effect"], "superset")
+
+
+class TestUnsupportedWirefilterConstrucs(unittest.TestCase):
+    """Bracket access and unsupported functions parse into prunable nodes, fail at translation."""
+
+    def test_len_parses_to_unsupported_func_node(self):
+        node = parse('len(http.request.headers["x"]) > 0')
+        self.assertEqual(node, ("unsupported_func", "len"))
+
+    def test_any_parses_to_unsupported_func_node(self):
+        node = parse('any(http.request.headers["x"][*] eq "val")')
+        self.assertEqual(node, ("unsupported_func", "any"))
+
+    def test_unsupported_func_ast_to_str(self):
+        node = parse('any(http.request.headers["x"][*] eq "s")')
+        self.assertEqual(m._ast_to_str(node), "any(...)")
+
+    def test_len_raises_at_translation(self):
+        with self.assertRaises(m.ExprError) as ctx:
+            translate('len(path) > 0')
+        self.assertIn("len()", str(ctx.exception))
+        self.assertIn("no Analytics API equivalent", str(ctx.exception))
+
+    def test_any_raises_at_translation(self):
+        with self.assertRaises(m.ExprError) as ctx:
+            translate('any(http.request.headers["x"][*] eq "val")')
+        self.assertIn("any()", str(ctx.exception))
+        self.assertIn("--best-effort", str(ctx.exception))
+
+    def test_all_raises_at_translation(self):
+        with self.assertRaises(m.ExprError):
+            translate('all(http.request.headers["x"][*] eq "val")')
+
+    def test_lower_raises_at_translation(self):
+        with self.assertRaises(m.ExprError) as ctx:
+            translate('lower(path) eq "bot"')
+        self.assertIn("lower()", str(ctx.exception))
+
+    def test_bracket_access_parses_to_cmp(self):
+        node = parse('http.request.headers["x-custom"] eq "value"')
+        self.assertEqual(node[0], "cmp")
+        self.assertIn("[", node[1])
+
+    def test_bracket_access_raises_at_translation(self):
+        with self.assertRaises(m.ExprError) as ctx:
+            translate('http.request.headers["x-custom"] eq "value"')
+        self.assertIn("not stored in the Analytics dataset", str(ctx.exception))
+
+    def test_bracket_star_access_raises_at_translation(self):
+        with self.assertRaises(m.ExprError):
+            translate('http.request.headers["calibre-test-request"][*] eq "abc"')
+
+    def test_unsupported_func_unclosed_paren_errors(self):
+        with self.assertRaises(m.ExprError) as ctx:
+            parse('any(x')
+        self.assertIn("unclosed '('", str(ctx.exception))
+
+    def test_unsupported_func_nested_parens_consumed(self):
+        node = parse('any((x))')
+        self.assertEqual(node, ("unsupported_func", "any"))
+
+    def test_bracket_access_unclosed_errors(self):
+        with self.assertRaises(m.ExprError) as ctx:
+            parse('field["x"')
+        self.assertIn("unclosed '['", str(ctx.exception))
+
+    def test_bracket_access_nested_brackets_consumed(self):
+        node = parse('field[[0]] eq "x"')
+        self.assertEqual(node, ("cmp", "field[[0]]", "eq", ["x"]))
+
+    def test_not_node_ast_to_str(self):
+        node = ("not", ("cmp", "asn", "eq", ["1"]))
+        self.assertEqual(m._ast_to_str(node), "not (asn eq '1')")
+
+    def test_unsupported_func_with_trailing_in_braces_consumed(self):
+        node = parse('any(x) in {1 2}')
+        self.assertEqual(node, ("unsupported_func", "any"))
+
+    def test_unknown_standalone_field_raises_operator_error(self):
+        with self.assertRaises(m.ExprError) as ctx:
+            parse('bogusfield')
+        self.assertIn("expected an operator", str(ctx.exception))
+
+
+class TestVerifiedBotField(unittest.TestCase):
+    """cf.bot_management.verified_bot / cf.verified_bot boolean field."""
+
+    def test_infix_true(self):
+        self.assertEqual(translate("cf.bot_management.verified_bot eq true"),
+                         {"verifiedBot": True})
+
+    def test_infix_false(self):
+        self.assertEqual(translate("cf.bot_management.verified_bot eq false"),
+                         {"verifiedBot": False})
+
+    def test_short_alias(self):
+        self.assertEqual(translate("cf.verified_bot eq true"), {"verifiedBot": True})
+
+    def test_standalone_truthy(self):
+        node = parse("cf.bot_management.verified_bot")
+        self.assertEqual(node, ("cmp", "cf.bot_management.verified_bot", "eq", ["true"]))
+        self.assertEqual(translate("cf.bot_management.verified_bot"), {"verifiedBot": True})
+
+    def test_negated_standalone(self):
+        self.assertEqual(translate("not cf.bot_management.verified_bot"),
+                         {"verifiedBot": False})
+
+    def test_negated_infix(self):
+        self.assertEqual(translate("not cf.bot_management.verified_bot eq true"),
+                         {"verifiedBot": False})
+
+    def test_in_compound(self):
+        result = translate("cf.bot_management.verified_bot and ip.geoip.asnum eq 15169")
+        self.assertIn("AND", result)
+        self.assertIn({"verifiedBot": True}, result["AND"])
+
+    def test_bad_value_errors(self):
+        with self.assertRaises(m.ExprError) as ctx:
+            translate("cf.bot_management.verified_bot eq maybe")
+        self.assertIn("boolean field", str(ctx.exception))
+
+
+class TestWhereFunctionCallSyntax(unittest.TestCase):
+    """starts_with(field, value) / ends_with(field, value) — Cloudflare wirefilter function form."""
+
+    def test_starts_with_basic(self):
+        self.assertEqual(parse('starts_with(path, "/api")'),
+                         ("cmp", "path", "starts", ["/api"]))
+
+    def test_ends_with_basic(self):
+        self.assertEqual(parse('ends_with(path, ".json")'),
+                         ("cmp", "path", "ends", [".json"]))
+
+    def test_starts_with_wirefilter_alias_field(self):
+        node = parse('starts_with(http.request.uri.path, "/users/auth/")')
+        self.assertEqual(node, ("cmp", "http.request.uri.path", "starts", ["/users/auth/"]))
+
+    def test_ends_with_wirefilter_alias_field(self):
+        node = parse('ends_with(http.request.uri.path, "/callback")')
+        self.assertEqual(node, ("cmp", "http.request.uri.path", "ends", ["/callback"]))
+
+    def test_function_call_in_compound_expression(self):
+        expr = ('(starts_with(http.request.uri.path, "/users/auth/") and '
+                '(http.request.uri.path contains "facebook" or '
+                'http.request.uri.path contains "shopify"))')
+        node = parse(expr)
+        self.assertEqual(node[0], "and")
+        self.assertEqual(node[1][0], ("cmp", "http.request.uri.path", "starts", ["/users/auth/"]))
+
+    def test_function_call_mixed_with_infix(self):
+        node = parse('starts_with(path, "/api") or path ends_with ".json"')
+        self.assertEqual(node[0], "or")
+        self.assertEqual(node[1][0][2], "starts")
+        self.assertEqual(node[1][1][2], "ends")
+
+    def test_function_call_with_not(self):
+        node = parse('not starts_with(path, "/api")')
+        self.assertEqual(node, ("not", ("cmp", "path", "starts", ["/api"])))
+
+    def test_starts_with_without_paren_errors(self):
+        with self.assertRaises(m.ExprError) as ctx:
+            parse("starts_with path eq 1")
+        self.assertIn("function", str(ctx.exception).lower())
+
+    def test_starts_with_non_word_field_errors(self):
+        with self.assertRaises(m.ExprError):
+            parse('starts_with("literal", "/api")')
+
+    def test_starts_with_missing_comma_errors(self):
+        with self.assertRaises(m.ExprError):
+            parse('starts_with(path "/api")')
+
+    def test_starts_with_missing_value_errors(self):
+        with self.assertRaises(m.ExprError):
+            parse("starts_with(path, )")
+
+    def test_starts_with_unclosed_paren_errors(self):
+        with self.assertRaises(m.ExprError):
+            parse('starts_with(path, "/api"')
+
+    def test_translate_starts_with_function_call(self):
+        self.assertEqual(translate('starts_with(path, "/api")'),
+                         {"clientRequestPath_like": "/api%"})
+
+    def test_translate_ends_with_function_call(self):
+        self.assertEqual(translate('ends_with(path, ".json")'),
+                         {"clientRequestPath_like": "%.json"})
+
+    def test_translate_with_wirefilter_alias(self):
+        self.assertEqual(translate('starts_with(http.request.uri.path, "/users/auth/")'),
+                         {"clientRequestPath_like": "/users/auth/%"})
+
+    def test_translate_function_call_negated(self):
+        self.assertEqual(translate('not starts_with(path, "/api")'),
+                         {"clientRequestPath_notlike": "/api%"})
+
+    def test_translate_function_call_in_compound(self):
+        expr = ('starts_with(http.request.uri.path, "/users/auth/") and '
+                '(http.request.uri.path contains "facebook" or '
+                'http.request.uri.path contains "shopify")')
+        result = translate(expr)
+        self.assertEqual(result["AND"][0], {"clientRequestPath_like": "/users/auth/%"})
+        self.assertIn("OR", result["AND"][1])
+
+
 class TestWhereTranslate(unittest.TestCase):
     def test_every_operator(self):
         self.assertEqual(translate("asn eq 64496"), {"clientAsn": 64496})
@@ -919,6 +1215,46 @@ class TestMain(unittest.TestCase):
         with captured(), self.assertRaises(SystemExit):
             with mock.patch.object(m.sys, "argv", ["flareql.py", "--token", "t"]):
                 m.main()
+
+    def test_best_effort_entire_prune_falls_back_to_base_filter(self):
+        out, err, fake = run_main(
+            BASE + ["--dataset", "http", "--dims", "ip", "--best-effort", "--verbose",
+                    "--where", 'any(http.request.headers["x"][*] eq "s")'],
+            fake=FakeAPI()
+        )
+        self.assertIn("entire expression pruned", err)
+        self.assertTrue(fake.queries)
+
+
+class TestDryRun(unittest.TestCase):
+    def test_dry_run_without_where(self):
+        out, _, _ = run_main(BASE + ["--dry-run"])
+        self.assertIn("[dry-run] window", out)
+        self.assertIn("[dry-run] datasets: http, firewall", out)
+        self.assertNotIn("--where", out)
+
+    def test_dry_run_with_where_translates_per_dataset(self):
+        out, _, _ = run_main(BASE + ["--dry-run", "--where", "asn eq 1"])
+        self.assertIn("[dry-run] AST", out)
+        self.assertIn("[http] filter:", out)
+        self.assertIn("[firewall] filter:", out)
+
+    def test_dry_run_where_translate_error_without_best_effort(self):
+        out, _, _ = run_main(BASE + ["--dry-run", "--dataset", "http",
+                                     "--where", 'http.request.headers["x"] eq "y"'])
+        self.assertIn("[dry-run] [http] error:", out)
+
+    def test_dry_run_best_effort_prints_pruned(self):
+        out, _, _ = run_main(
+            BASE + ["--dry-run", "--dataset", "http", "--best-effort",
+                    "--where", 'any(http.request.headers["x"][*] eq "s")']
+        )
+        self.assertIn("filter (best-effort):", out)
+        self.assertIn("pruned (none):", out)
+
+    def test_dry_run_where_parse_error_dies(self):
+        with self.assertRaises(SystemExit):
+            run_main(BASE + ["--dry-run", "--where", "asn eq"])
 
 
 if __name__ == "__main__":
