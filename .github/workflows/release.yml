@@ -1,14 +1,72 @@
 name: Release
 
+# Cutting a release is a deliberate, manual action — not an automatic side effect of
+# merging to main. CHANGELOG.md is the single source of truth for both the version
+# number and the release notes: run this from the Actions tab only after CHANGELOG.md's
+# top section has been renamed from "## [Unreleased]" to "## [vX.Y.Z] - YYYY-MM-DD" on
+# main (see CONTRIBUTING.md's "Releases" section). See docs/adr/0001-release-cadence.md
+# for why this replaced "every merge to main is a release".
 on:
-  pull_request:
-    types: [closed]
-    branches:
-      - main
+  workflow_dispatch:
 
 jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.changelog.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Extract version + notes from CHANGELOG.md
+        id: changelog
+        run: |
+          python3 - <<'PY'
+          import os
+          import re
+          import sys
+
+          text = open("CHANGELOG.md").read()
+          headings = list(re.finditer(r"^## \[([^\]]+)\](?:\s*-\s*(\d{4}-\d{2}-\d{2}))?",
+                                       text, re.M))
+          release = next((h for h in headings if h.group(1).lower() != "unreleased"), None)
+          if release is None:
+              sys.exit("::error::CHANGELOG.md has no dated release section above "
+                        "[Unreleased] — rename [Unreleased] to [vX.Y.Z] - YYYY-MM-DD "
+                        "on main before running this workflow.")
+          if not release.group(2):
+              sys.exit(f"::error::CHANGELOG.md section '{release.group(1)}' has no date "
+                        "(expected '## [vX.Y.Z] - YYYY-MM-DD').")
+
+          version = "v" + release.group(1).lstrip("vV")
+          next_heading = next((h for h in headings if h.start() > release.start()), None)
+          notes = text[release.end():(next_heading.start() if next_heading else len(text))].strip()
+          if not notes:
+              sys.exit(f"::error::CHANGELOG.md section '{release.group(1)}' is empty — "
+                        "nothing to release.")
+
+          open("release_notes.md", "w").write(notes + "\n")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"version={version}\n")
+          print(f"Release {version}: {len(notes.splitlines())} lines of notes")
+          PY
+
+      - name: Refuse to re-release an existing tag
+        run: |
+          VERSION="${{ steps.changelog.outputs.version }}"
+          if git ls-remote --tags origin "refs/tags/${VERSION}" | grep -q .; then
+            echo "::error::tag ${VERSION} already exists — bump CHANGELOG.md's version heading"
+            exit 1
+          fi
+
+      - name: Upload release notes for the release job
+        uses: actions/upload-artifact@v4
+        with:
+          name: release_notes
+          path: release_notes.md
+          if-no-files-found: error
+
   build:
-    if: github.event.pull_request.merged == true
+    needs: check
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -59,20 +117,13 @@ jobs:
           if-no-files-found: error
 
   release:
-    needs: build
+    needs: [check, build]
     runs-on: ubuntu-latest
     permissions:
       contents: write
 
     steps:
       - uses: actions/checkout@v4
-
-      - name: Derive version from branch name
-        id: ver
-        run: |
-          BRANCH="${{ github.event.pull_request.head.ref }}"
-          VERSION="v${BRANCH#v}"
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
 
       - name: Download all binaries
         uses: actions/download-artifact@v4
@@ -81,9 +132,15 @@ jobs:
           pattern: flareql-*
           merge-multiple: true
 
+      - name: Download release notes
+        uses: actions/download-artifact@v4
+        with:
+          name: release_notes
+          path: .
+
       - name: Create repo archive
         run: |
-          VERSION="${{ steps.ver.outputs.version }}"
+          VERSION="${{ needs.check.outputs.version }}"
           git archive --format=tar.gz \
             --prefix="flareql-${VERSION}/" \
             HEAD \
@@ -93,7 +150,10 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          VERSION="${{ steps.ver.outputs.version }}"
+          VERSION="${{ needs.check.outputs.version }}"
+          # gh creates the git tag at the current HEAD (the ref this workflow ran
+          # against) since it doesn't exist yet — checked in the "check" job above.
           gh release create "$VERSION" dist/* \
             --title "flareql $VERSION" \
-            --generate-notes
+            --notes-file release_notes.md \
+            --target "$GITHUB_SHA"
