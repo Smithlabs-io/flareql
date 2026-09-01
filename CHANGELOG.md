@@ -23,10 +23,14 @@ project follows [Semantic Versioning](https://semver.org/).
   is a visibility change, not a behavior change. See README's "Deprecated wirefilter
   spellings" section for Cloudflare's own (undated) deprecation status.
 
-## [1.0.1]
+## [1.0.1] - 2026-08-19
 
 - See git history — predates this changelog.
 
-## [1.0.0]
+## [1.0.0] - 2026-08-17
 
 - Initial release.
+
+[Unreleased]: https://github.com/Smithlabs-io/flareql/compare/v1.0.1...HEAD
+[1.0.1]: https://github.com/Smithlabs-io/flareql/compare/v1.0.0...v1.0.1
+[1.0.0]: https://github.com/Smithlabs-io/flareql/releases/tag/v1.0.0
