@@ -7,6 +7,8 @@ Pulls the Cloudflare dashboard's Security Analytics / Security Events "top N" pa
 scores, rules fired, actions) via the GraphQL Analytics API — the views that have no
 export/print button in the web UI. Stdlib only, no pip installs.
 
+See [CHANGELOG.md](CHANGELOG.md) for release history and field-support changes.
+
 ## Auth
 
 Create an API token at dash.cloudflare.com → My Profile → API Tokens with:
@@ -30,7 +32,7 @@ Legacy global key also works: `--auth-email` / `--auth-key` or `CLOUDFLARE_EMAIL
 
 | Flag | GraphQL node | Dashboard equivalent | Dimensions |
 |------|--------------|----------------------|------------|
-| `--dataset http` | `httpRequestsAdaptiveGroups` | Security → Analytics (sampled traffic) | asn, ip, ua, country, host, path, ja4, botscore, status, botsrc, attackclass, security, cache (+opt-in: attackscore, sqli, xss, rce) |
+| `--dataset http` | `httpRequestsAdaptiveGroups` | Security → Analytics (sampled traffic) | asn, ip, ua, country, host, path, ja4, botscore, status, content, botsrc, attackclass, security, cache (+opt-in: attackscore, sqli, xss, rce) |
 | `--dataset firewall` | `firewallEventsAdaptiveGroups` | Security → Events (mitigations) | asn, ip, ua, country, host, path, ja4, action, rule |
 | `--dataset both` (default) | both | both | all of the above |
 
@@ -44,7 +46,7 @@ share of the whole filtered window.
 |---------------|----------------|
 | Request rate analysis | `--timeseries minute\|5min\|15min\|hour\|day` — request counts per bucket (console shows an ASCII rate chart + peak/avg req/s; full series in `--out`). Respects all filters, so `--asn 64496 --timeseries 5min` charts just that slice. |
 | Bot analysis | `--dims botscore,botsrc,ja4` — score distribution, score source (machine_learning / heuristics / verified_bot...), fingerprints. Filter with `--bot-score-min/max` or `--where 'botscore lt 30'`. |
-| Attack analysis | `--dims attackclass,security` for the class breakdown (attack / likely_attack / likely_clean / clean); add `--dims attackscore,sqli,xss,rce` for raw 1-99 score distributions (opt-in, not in `all`). Filter with `--where 'cf.waf.score lt 20'`. |
+| Attack analysis | `--dims attackclass,security` for the class breakdown (attack / likely_attack / likely_clean / clean); add `--dims attackscore,sqli,xss,rce` for raw 1-99 score distributions (opt-in, not in `all`). Filter with `--where 'cf.waf.score lt 20'` or `--where 'cf.waf.score.class eq attack'`. |
 | Traffic analysis | `--dims security,cache,status` — what mitigated requests (securityAction + securitySource), served-by-cache vs origin (cacheStatus), response codes. |
 
 Note: bot/attack scores exist only on the http dataset — firewall events carry rule
@@ -142,12 +144,17 @@ expression and translates it. It combines (AND) with any other filter flags.
 - **Operators:** `and` `or` `not`, parens, `eq ne lt le gt ge` (or `== != < <= > >=`),
   `in {a b c}` (or `in (a, b, c)`), `contains`, `wildcard` (`*` → any), `starts_with`, `ends_with`
 - **Fields:** `asn`, `country`, `ip`, `host`, `path`, `ua`, `ja4`, `botscore`, `status`,
-  `method`, `botsrc`, `attackscore`, `sqli`, `xss`, `rce`, `securityaction`, `cache` (http)
-  · `action`, `ruleid` (firewall) — plus wirefilter spellings (`ip.geoip.asnum`,
-  `ip.geoip.country`, `http.host`, `http.request.uri.path`, `http.user_agent`,
-  `cf.bot_management.score`, `cf.bot_management.ja4`, `cf.waf.score[.sqli|.xss|.rce]`, `ip.src`)
-- **Not supported:** `matches` (regex) — the Analytics API has no regex operator; use
-  `contains`/`wildcard`. Fields outside the list above (headers, cookies, TLS details)
+  `content`, `method`, `botsrc`, `attackscore`, `attackclass`, `sqli`, `xss`, `rce`,
+  `securityaction`, `cache`, `verifiedbot` (http) · `action`, `ruleid` (firewall) — plus
+  wirefilter spellings where a real one exists (`ip.geoip.asnum`/`ip.src.asnum`,
+  `ip.geoip.country`/`ip.src.country`, `http.host`, `http.request.uri.path`,
+  `http.user_agent`, `cf.bot_management.score`, `cf.bot_management.ja4`,
+  `cf.waf.score[.class|.sqli|.xss|.rce]`, `ip.src`, `cf.bot_management.verified_bot`)
+- **Not supported:** `matches` (regex), and wirefilter functions like `any()`, `all()`,
+  `len()`, `lower()`, `concat()` — the Analytics API has no regex operator and can't
+  filter on computed values; use `contains`/`wildcard` instead of regex, or `--best-effort`
+  to prune these clauses and run with what's left (see `--dry-run -v` and `--best-effort`
+  below). Fields outside the list above (headers, cookies, TLS details, request body)
   aren't exposed by these datasets.
 - `not` is handled by operator negation (De Morgan), since the API has no NOT — so any
   `not` you write works, it just compiles to `_neq`/`_notin`/`_notlike`/flipped ranges.
@@ -155,6 +162,76 @@ expression and translates it. It combines (AND) with any other filter flags.
 - If an expression references a field a dataset doesn't have (e.g. `botscore` on
   firewall), that dataset is skipped with a warning rather than silently dropping the
   condition.
+
+### `--where` isn't real wirefilter — read this before assuming a field works
+
+`--where` is a small WAF-rule-*shaped* parser that compiles down to the Analytics
+GraphQL API's own filter syntax (`_eq`/`_in`/`_like`/... suffixes on a filter object).
+It is **not** Cloudflare's wirefilter engine, and the fields it accepts are **not** the
+same universe as the fields you can write into an actual WAF custom rule. Two different
+schemas are in play, and they don't line up:
+
+- **Wirefilter / Rules language** — the real engine behind WAF custom rules,
+  Transform Rules, etc. Its complete, authoritative field list is Cloudflare's
+  [Rules language fields reference](https://developers.cloudflare.com/ruleset-engine/rules-language/fields/reference/).
+  It evaluates one live request at a time and can see things (raw headers, cookies,
+  request body, `cf.threat_score`, `ip.geoip.continent`, TLS/JA3 detail...) that are
+  simply never written to the Analytics dataset, so no tool can filter on them here —
+  wirefilter fields with no analytics dimension always fail to translate.
+- **GraphQL Analytics API** — the aggregated dataset `--where`/`--dims` actually query
+  (`httpRequestsAdaptiveGroups` / `firewallEventsAdaptiveGroups`). Its field list is the
+  GraphQL schema itself — browse it with introspection or Cloudflare's
+  [GraphiQL explorer](https://graphql.cloudflare.com), see the
+  [GraphQL Analytics API docs](https://developers.cloudflare.com/analytics/graphql-api/)
+  for how the dataset/filter model works. Some of its fields have no wirefilter
+  counterpart at all, because they're analytics-only summaries.
+
+The `content` field is the clearest example of the mismatch that prompted this section.
+`--where "content eq html"` filters on the GraphQL dimension `edgeResponseContentTypeName`
+— a coarse, pre-bucketed category (`html`, `javascript`, `image`, `json`, ...) that only
+exists in the Analytics schema. The closest-sounding wirefilter field,
+`http.response.content_type.media_type`, is the *actual MIME type* of one request
+(e.g. `text/html; charset=utf-8`) and isn't stored in this dataset at all — you can't
+get from one to the other, so flareql doesn't pretend `content` is a wirefilter alias.
+`status`, by contrast, really is the same concept both places (`edgeResponseStatus` here,
+`http.response.code` in a WAF rule), which is why `--where "status eq 200 and content eq html"`
+works as one expression even though only half of it would paste into the dashboard's rule
+builder.
+
+The reverse gap matters too: short names like `botscore`, `attackscore`, `sqli`, `xss`,
+`rce`, `securityaction`, `cache`, `botsrc`, `ruleid`, and `content` are flareql's own
+canonical keys for a GraphQL dimension — they are **not** valid wirefilter field IDs, so
+don't expect them to work if you paste an expression into an actual Cloudflare WAF rule.
+Where the field means the same thing in both worlds, the real wirefilter spelling is
+accepted as an alias too (see the alias list above); where it doesn't, only the flareql
+name exists.
+
+When in doubt: run `--dry-run -v --where '...'` to see the parsed AST and the exact
+filter object sent per dataset before spending a query on it, and check
+`--inspect`'s field list for what this zone's plan actually exposes.
+
+#### Deprecated wirefilter spellings (`ip.geoip.*`)
+
+`ip.geoip.asnum` and `ip.geoip.country` are Cloudflare's own legacy field spellings.
+Cloudflare's [field reference](https://developers.cloudflare.com/cloudflare-one/reusable-components/packet-filtering-fields/)
+marks them deprecated in favor of `ip.src.asnum` / `ip.src.country`, but as of this
+writing still accepts them with **no removal date announced** — there's no entry for
+either field on Cloudflare's [deprecations tracker](https://developers.cloudflare.com/deprecations).
+
+flareql's policy: accept a legacy spelling for as long as Cloudflare's API does, and
+surface the deprecation instead of hiding it. Concretely:
+
+- Both spellings translate identically (`ip.geoip.asnum` and `ip.src.asnum` both resolve
+  to `asn`; same for the country pair) — using the legacy form costs you nothing today.
+- Using one prints a one-time stderr notice naming the current replacement, e.g.:
+  ```
+  [warn] --where: 'ip.geoip.asnum' is a Cloudflare-deprecated wirefilter spelling (no removal date announced) — prefer 'ip.src.asnum'
+  ```
+  This is the CLI equivalent of a language runtime's deprecation warning (e.g. Python's
+  `DeprecationWarning`) — flareql has no library API to attach a warning to, so it's
+  emitted to stderr at `--where` parse time instead, once per distinct field per run.
+- If Cloudflare ever publishes a removal date on the deprecations tracker, this README
+  and the notice text get a hard sunset date; until then both spellings keep working.
 
 ## Recipes
 

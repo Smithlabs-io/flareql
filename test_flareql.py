@@ -769,6 +769,12 @@ class TestWhereTranslate(unittest.TestCase):
         self.assertEqual(translate("cf.waf.score lt 20"), {"wafAttackScore_lt": 20})
         self.assertEqual(translate("cf.waf.score.sqli lt 20"), {"wafSqliAttackScore_lt": 20})
 
+    def test_attackclass_field(self):
+        self.assertEqual(translate("attackclass eq attack"),
+                         {"wafAttackScoreClass": "attack"})
+        self.assertEqual(translate("cf.waf.score.class eq attack"),
+                         {"wafAttackScoreClass": "attack"})
+
     def test_asn_typing_and_prefix(self):
         self.assertEqual(translate("asn eq AS64496", "firewall", True),
                          {"clientAsn": "64496"})
@@ -787,6 +793,13 @@ class TestWhereTranslate(unittest.TestCase):
         with self.assertRaises(m.ExprError):
             translate("frobnitz eq 1")
 
+    def test_content_field(self):
+        self.assertEqual(translate("status eq 200 and content eq html"),
+                         {"AND": [{"edgeResponseStatus": 200},
+                                  {"edgeResponseContentTypeName": "html"}]})
+        with self.assertRaises(m.ExprError):
+            translate("content eq html", "firewall", True)
+
     def test_dataset_mismatch_hints(self):
         with self.assertRaises(m.ExprError) as ctx:
             translate("botscore lt 30", "firewall", True)
@@ -794,6 +807,40 @@ class TestWhereTranslate(unittest.TestCase):
         with self.assertRaises(m.ExprError) as ctx:
             translate("action eq block", "http", False)
         self.assertNotIn("security", str(ctx.exception))
+
+
+class TestLegacyWhereFieldWarning(unittest.TestCase):
+    def parse(self, expr):
+        return m.WhereParser(m.tokenize_where(expr)).parse()
+
+    def test_legacy_field_warns_with_replacement(self):
+        with captured() as (_, err):
+            m.warn_legacy_where_fields(self.parse("ip.geoip.asnum eq 64496"))
+        self.assertIn("ip.geoip.asnum", err.getvalue())
+        self.assertIn("ip.src.asnum", err.getvalue())
+
+    def test_current_spelling_no_warning(self):
+        with captured() as (_, err):
+            m.warn_legacy_where_fields(self.parse("ip.src.asnum eq 64496"))
+        self.assertEqual(err.getvalue(), "")
+
+    def test_canonical_short_name_no_warning(self):
+        with captured() as (_, err):
+            m.warn_legacy_where_fields(self.parse("asn eq 64496"))
+        self.assertEqual(err.getvalue(), "")
+
+    def test_repeated_legacy_field_warns_once(self):
+        with captured() as (_, err):
+            m.warn_legacy_where_fields(
+                self.parse("ip.geoip.asnum eq 64496 or ip.geoip.asnum eq 64497"))
+        self.assertEqual(err.getvalue().count("ip.geoip.asnum"), 1)
+
+    def test_two_distinct_legacy_fields_both_warn(self):
+        with captured() as (_, err):
+            m.warn_legacy_where_fields(
+                self.parse("ip.geoip.asnum eq 64496 and ip.geoip.country eq RU"))
+        self.assertIn("ip.geoip.asnum", err.getvalue())
+        self.assertIn("ip.geoip.country", err.getvalue())
 
 
 # ---------------------------------------------------------------- query layer

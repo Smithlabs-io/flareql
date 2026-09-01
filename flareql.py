@@ -74,6 +74,7 @@ HTTP_DIMS = {
     "ja4": (["ja4"], "Top JA4 fingerprints"),
     "botscore": (["botScore"], "Bot score distribution"),
     "status": (["edgeResponseStatus"], "Edge response status codes"),
+    "content": (["edgeResponseContentTypeName"], "Content types served"),
     # dashboard "Bot analysis" tab
     "botsrc": (["botScoreSrcName"], "Bot score sources"),
     # dashboard "Attack analysis" tab
@@ -321,9 +322,15 @@ WHERE_FIELDS = {
     "ja4":      ("ja4", "str", ("http", "firewall")),
     "botscore": ("botScore", "int", ("http",)),
     "status":   ("edgeResponseStatus", "int", ("http",)),
+    # analytics-only bucket ("html", "javascript", "image"...) — no wirefilter field
+    # produces this; the closest real WAF-rule field, http.response.content_type.media_type,
+    # is the full MIME type and isn't stored in this dataset. See README "wirefilter vs
+    # GraphQL fields".
+    "content":  ("edgeResponseContentTypeName", "str", ("http",)),
     "method":   ("clientRequestHTTPMethodName", "str", ("http",)),
     "botsrc":   ("botScoreSrcName", "str", ("http",)),
     "attackscore": ("wafAttackScore", "int", ("http",)),
+    "attackclass": ("wafAttackScoreClass", "str", ("http",)),
     "sqli":     ("wafSqliAttackScore", "int", ("http",)),
     "xss":      ("wafXssAttackScore", "int", ("http",)),
     "rce":      ("wafRceAttackScore", "int", ("http",)),
@@ -335,6 +342,13 @@ WHERE_FIELDS = {
 }
 
 # wirefilter names (as used in WAF rule expressions) -> canonical
+#
+# ip.geoip.asnum / ip.geoip.country are Cloudflare's legacy spellings: the current field
+# reference documents them as deprecated in favor of ip.src.*, but still accepts them with
+# no removal date announced (checked https://developers.cloudflare.com/deprecations —
+# no entry for these fields as of this writing). We accept both for as long as Cloudflare
+# does; LEGACY_WIREFILTER_FIELDS below drives a one-time runtime notice pointing at the
+# current spelling, so this stays visible without holding up any actual query.
 WHERE_ALIASES = {
     "ip.geoip.asnum": "asn", "ip.src.asnum": "asn",
     "ip.geoip.country": "country", "ip.src.country": "country",
@@ -347,10 +361,43 @@ WHERE_ALIASES = {
     "http.response.code": "status",
     "http.request.method": "method",
     "cf.waf.score": "attackscore", "waf.score": "attackscore",
+    "cf.waf.score.class": "attackclass",
     "cf.waf.score.sqli": "sqli", "cf.waf.score.xss": "xss", "cf.waf.score.rce": "rce",
     "cf.bot_management.verified_bot": "verifiedbot",
     "cf.verified_bot": "verifiedbot",
 }
+
+# legacy spelling -> current spelling, per Cloudflare's own field reference. No sunset/removal
+# date is published (see the WHERE_ALIASES comment above) — re-check
+# https://developers.cloudflare.com/deprecations before assuming that stays true.
+LEGACY_WIREFILTER_FIELDS = {
+    "ip.geoip.asnum": "ip.src.asnum",
+    "ip.geoip.country": "ip.src.country",
+}
+
+
+def warn_legacy_where_fields(node):
+    """Emit one stderr notice per distinct Cloudflare-deprecated wirefilter spelling used
+    in a --where expression, pointing at the current replacement. Mirrors the standard
+    runtime-deprecation-warning pattern (cf. Python's DeprecationWarning) since this tool
+    has no library API to attach warnings to — stderr at parse time is the CLI equivalent."""
+    seen = set()
+
+    def walk(n):
+        kind = n[0]
+        if kind == "cmp":
+            field = n[1].lower()
+            if field in LEGACY_WIREFILTER_FIELDS and field not in seen:
+                seen.add(field)
+                warn(f"--where: '{field}' is a Cloudflare-deprecated wirefilter spelling "
+                     f"(no removal date announced) — prefer '{LEGACY_WIREFILTER_FIELDS[field]}'")
+        elif kind == "not":
+            walk(n[1])
+        elif kind in ("and", "or"):
+            for child in n[1]:
+                walk(child)
+
+    walk(node)
 
 KEYWORDS = {"and", "or", "not", "in", "eq", "ne", "lt", "le", "gt", "ge",
             "contains", "matches", "wildcard", "starts_with", "ends_with"}
@@ -1120,9 +1167,10 @@ def parse_args():
                         "Supports and/or/not, parens, eq ne lt le gt ge == != < <= > >=, "
                         "in {a b c}, contains, wildcard, starts_with, ends_with. "
                         "Fields: asn, country, ip, host, path, ua, ja4, botscore, status, "
-                        "method (http) / action, ruleid (firewall) — or wirefilter names "
-                        "like ip.geoip.asnum, cf.bot_management.score. Example: "
-                        "\"asn in {64496 64497} or (botscore lt 30 and country eq RU)\"")
+                        "content, method (http) / action, ruleid (firewall) — or wirefilter "
+                        "names like ip.geoip.asnum, cf.bot_management.score, where one exists "
+                        "(not every accepted field name is real wirefilter — see README). "
+                        "Example: \"status eq 200 and content eq html\"")
     # output
     p.add_argument("--out", help="write results to this path (json file, or directory for csv)")
     p.add_argument("--format", choices=["json", "csv"], default="json",
@@ -1158,6 +1206,7 @@ def main():
                 where_ast = WhereParser(tokenize_where(args.where)).parse()
             except ExprError as e:
                 die(f"--where: {e}")
+            warn_legacy_where_fields(where_ast)
         print(f"[dry-run] window  : {since} → {until}")
         print(f"[dry-run] datasets: {', '.join(dataset_keys)}")
         if where_ast:
@@ -1219,6 +1268,7 @@ def main():
             where_ast = WhereParser(tokenize_where(args.where)).parse()
         except ExprError as e:
             die(f"--where: {e}")
+        warn_legacy_where_fields(where_ast)
         vprint(f"[where] expression : {args.where}")
         vprint(f"[where] AST        : {_ast_to_str(where_ast)}")
 
