@@ -23,6 +23,16 @@ project follows [Semantic Versioning](https://semver.org/).
   is a visibility change, not a behavior change. See README's "Deprecated wirefilter
   spellings" section for Cloudflare's own (undated) deprecation status.
 
+### Fixed
+
+- `cf.verified_bot` / `cf.bot_management.verified_bot` filters failed on every run with
+  `unknown arg verifiedBot`: the GraphQL API has no boolean `verifiedBot` argument. The
+  field now maps to `verifiedBotCategory` (`eq true` -> `verifiedBotCategory_neq: ""`,
+  `eq false` -> `verifiedBotCategory: ""`). It is the closest available signal and can
+  differ slightly from the `verified_bot` bot score source (`--dims botsrc`).
+- `--where` that can't be applied to any selected dataset now exits 1 with an error
+  instead of exiting 0 with an empty-looking output.
+
 ## [1.0.1] - 2026-08-19
 
 - See git history — predates this changelog.

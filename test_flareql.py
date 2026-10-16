@@ -611,37 +611,81 @@ class TestVerifiedBotField(unittest.TestCase):
 
     def test_infix_true(self):
         self.assertEqual(translate("cf.bot_management.verified_bot eq true"),
-                         {"verifiedBot": True})
+                         {"verifiedBotCategory_neq": ""})
 
     def test_infix_false(self):
         self.assertEqual(translate("cf.bot_management.verified_bot eq false"),
-                         {"verifiedBot": False})
+                         {"verifiedBotCategory": ""})
 
     def test_short_alias(self):
-        self.assertEqual(translate("cf.verified_bot eq true"), {"verifiedBot": True})
+        self.assertEqual(translate("cf.verified_bot eq true"), {"verifiedBotCategory_neq": ""})
 
     def test_standalone_truthy(self):
         node = parse("cf.bot_management.verified_bot")
         self.assertEqual(node, ("cmp", "cf.bot_management.verified_bot", "eq", ["true"]))
-        self.assertEqual(translate("cf.bot_management.verified_bot"), {"verifiedBot": True})
+        self.assertEqual(translate("cf.bot_management.verified_bot"), {"verifiedBotCategory_neq": ""})
 
     def test_negated_standalone(self):
         self.assertEqual(translate("not cf.bot_management.verified_bot"),
-                         {"verifiedBot": False})
+                         {"verifiedBotCategory": ""})
 
     def test_negated_infix(self):
         self.assertEqual(translate("not cf.bot_management.verified_bot eq true"),
-                         {"verifiedBot": False})
+                         {"verifiedBotCategory": ""})
 
     def test_in_compound(self):
         result = translate("cf.bot_management.verified_bot and ip.geoip.asnum eq 15169")
         self.assertIn("AND", result)
-        self.assertIn({"verifiedBot": True}, result["AND"])
+        self.assertIn({"verifiedBotCategory_neq": ""}, result["AND"])
 
     def test_bad_value_errors(self):
         with self.assertRaises(m.ExprError) as ctx:
             translate("cf.bot_management.verified_bot eq maybe")
         self.assertIn("boolean field", str(ctx.exception))
+
+    def test_ne_flips(self):
+        self.assertEqual(translate("cf.verified_bot ne true"), {"verifiedBotCategory": ""})
+        self.assertEqual(translate("cf.verified_bot ne false"), {"verifiedBotCategory_neq": ""})
+
+    def test_never_emits_unknown_verifiedbot_arg(self):
+        # the GraphQL API has no boolean `verifiedBot` argument (unknown arg error)
+        for expr in ("cf.verified_bot", "not cf.verified_bot", "cf.verified_bot eq false"):
+            self.assertNotIn("verifiedBot", translate(expr))
+
+    def test_unsupported_operator_errors(self):
+        with self.assertRaises(m.ExprError) as ctx:
+            translate("cf.verified_bot in {true false}")
+        self.assertIn("only eq/ne", str(ctx.exception))
+
+    def test_firewall_dataset_has_no_field(self):
+        node = parse("cf.verified_bot eq true")
+        with self.assertRaises(m.ExprError) as ctx:
+            m.translate_where(node, "firewall", True)
+        self.assertIn("use --dataset http", str(ctx.exception))
+
+
+class TestVerifiedBotMain(unittest.TestCase):
+    """End-to-end through main(): the query sent to the API and the exit behaviour."""
+
+    def test_http_query_filters_on_category(self):
+        _, _, fake = run_main(BASE + ["--dataset", "http", "--where", "cf.verified_bot eq true"])
+        sent = "\n".join(fake.queries)
+        self.assertIn('verifiedBotCategory_neq: ""', sent)
+        self.assertNotIn("verifiedBot:", sent)
+
+    def test_all_datasets_skipped_exits_nonzero_without_output(self):
+        with mock.patch.object(m, "http_json", FakeAPI()), \
+             mock.patch.object(m.sys, "argv", ["flareql.py"] + BASE +
+                               ["--dataset", "firewall", "--where", "cf.verified_bot eq true"]), \
+             captured() as (_, err), self.assertRaises(SystemExit) as ctx:
+            m.main()
+        self.assertEqual(ctx.exception.code, 1)
+        self.assertIn("could not be applied to any selected dataset", err.getvalue())
+
+    def test_one_dataset_skipped_still_succeeds(self):
+        out, err, _ = run_main(BASE + ["--where", "cf.verified_bot eq true"])
+        self.assertIn("use --dataset http", err)
+        self.assertIn("Window total", out)
 
 
 class TestWhereFunctionCallSyntax(unittest.TestCase):

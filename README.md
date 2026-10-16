@@ -150,6 +150,9 @@ expression and translates it. It combines (AND) with any other filter flags.
   `ip.geoip.country`/`ip.src.country`, `http.host`, `http.request.uri.path`,
   `http.user_agent`, `cf.bot_management.score`, `cf.bot_management.ja4`,
   `cf.waf.score[.class|.sqli|.xss|.rce]`, `ip.src`, `cf.bot_management.verified_bot`)
+- **`verifiedbot`** is boolean (`eq`/`ne`, or bare) and http-only. The API has no boolean
+  for it, so it filters on `verifiedBotCategory` being non-empty — close to, but not
+  identical with, `--dims botsrc` = `verified_bot`.
 - **Not supported:** `matches` (regex), and wirefilter functions like `any()`, `all()`,
   `len()`, `lower()`, `concat()` — the Analytics API has no regex operator and can't
   filter on computed values; use `contains`/`wildcard` instead of regex, or `--best-effort`

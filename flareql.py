@@ -336,10 +336,15 @@ WHERE_FIELDS = {
     "rce":      ("wafRceAttackScore", "int", ("http",)),
     "securityaction": ("securityAction", "str", ("http",)),
     "cache":    ("cacheStatus", "str", ("http",)),
-    "verifiedbot": ("verifiedBot", "bool", ("http",)),
+    # boolean in wirefilter, but the GraphQL API has no boolean verifiedBot argument:
+    # it exposes verifiedBotCategory, a string that is "" when the request is not a verified bot
+    "verifiedbot": ("verifiedBotCategory", "bool", ("http",)),
     "action":   ("action", "str", ("firewall",)),
     "ruleid":   ("ruleId", "str", ("firewall",)),
 }
+
+# boolean wirefilter fields backed by a GraphQL string that is "" when false
+BOOL_AS_NONEMPTY_STR = {"verifiedbot"}
 
 # wirefilter names (as used in WAF rule expressions) -> canonical
 #
@@ -669,6 +674,8 @@ def where_cmp_to_filter(field, op, values, dataset_key, asn_as_string):
         if dataset_key == "firewall":
             hint = (" (firewall events carry no bot/attack scores — the http dataset's "
                     "'security' dim shows mitigation outcomes for scored traffic instead)")
+        if canon in BOOL_AS_NONEMPTY_STR:
+            hint = " (firewall events have no verified-bot field; use --dataset http)"
         raise ExprError(f"field '{field}' doesn't exist on the {dataset_key} dataset{hint}")
 
     def coerce(v):
@@ -689,6 +696,14 @@ def where_cmp_to_filter(field, op, values, dataset_key, asn_as_string):
             except ValueError:
                 raise ExprError(f"'{field}' expects a number, got {v!r}")
         return str(v)
+
+    if canon in BOOL_AS_NONEMPTY_STR:
+        # eq true / ne false -> category != "" ; eq false / ne true -> category == ""
+        if op not in ("eq", "neq"):
+            raise ExprError(f"'{field}' is boolean — only eq/ne with true or false is supported")
+        if coerce(values[0]) == (op == "eq"):
+            return {f"{gql_field}_neq": ""}
+        return {gql_field: ""}
 
     if op in ("in", "notin"):
         coerced = [coerce(v) for v in values]
@@ -1273,6 +1288,7 @@ def main():
         vprint(f"[where] AST        : {_ast_to_str(where_ast)}")
 
     all_pruned = {}
+    where_skipped = []
 
     def make_filter(ds_key, asn_as_string):
         flt = build_filter(args, ds_key, since, until, asn_as_string)
@@ -1330,6 +1346,7 @@ def main():
         except ExprError as e:
             warn(f"[{ds_key}] --where: {e} — skipping this dataset")
             results["datasets"][ds_key] = {"total": {"error": str(e)}, "dims": {}}
+            where_skipped.append(ds_key)
             continue
         rows, err = query_grouped(headers, zone_id, node, [], flt, 1, args.timeout)
         if err and "clientAsn" in err:
@@ -1391,6 +1408,10 @@ def main():
                 print_table(title, fields, rows, total_est, args.limit)
 
         results["datasets"][ds_key] = ds_result
+
+    if where_skipped and len(where_skipped) == len(dataset_keys):
+        die("--where could not be applied to any selected dataset "
+            f"({', '.join(where_skipped)}) — no data was queried and no output was written")
 
     if all_pruned:
         results["meta"]["pruned_clauses"] = all_pruned
