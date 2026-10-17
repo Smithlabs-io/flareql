@@ -7,10 +7,13 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+
+## [1.0.2] - 2026-10-16
+
 ### Added
 
 - `content` field (`edgeResponseContentTypeName`) — filter/dim on Cloudflare's bucketed
-  content-type category (`html`, `javascript`, `image`, ...). No wirefilter equivalent
+  content-type category (`html`, `javascript`, `image`, ...). No wirefilter equivalent2
   exists for this field; see README's "`--where` isn't real wirefilter" section.
 - `attackclass` field (`wafAttackScoreClass`), with wirefilter alias `cf.waf.score.class`
   — was already a `--dims` lens, now also filterable via `--where`.
