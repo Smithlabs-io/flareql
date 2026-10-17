@@ -171,7 +171,9 @@ class TestHelpers(unittest.TestCase):
         self.assertTrue(cut.endswith("…"))
 
     def test_estimated_requests(self):
-        self.assertEqual(m.estimated_requests({"count": 10, "avg": {"sampleInterval": 2.5}}), 25)
+        self.assertEqual(m.estimated_requests({"count": 10, "avg": {"sampleInterval": 2.5}}), 10)
+        # Regression for #13: count is already scaled; never multiply by sampleInterval
+        self.assertEqual(m.estimated_requests({"count": 100, "avg": {"sampleInterval": 6}}), 100)
         self.assertEqual(m.estimated_requests({"count": 10}), 10)
         self.assertEqual(m.estimated_requests({}), 0)
 
@@ -892,11 +894,10 @@ class TestLegacyWhereFieldWarning(unittest.TestCase):
 class TestQueryBuild(unittest.TestCase):
     def test_with_and_without_dimensions(self):
         q = m.build_query("Z", "httpRequestsAdaptiveGroups", ["clientIP"],
-                          {"a": 1}, 150, True, "count_DESC")
+                          {"a": 1}, 150, "count_DESC")
         self.assertIn("dimensions { clientIP }", q)
         self.assertIn("orderBy: [count_DESC]", q)
-        self.assertIn("avg { sampleInterval }", q)
-        q = m.build_query("Z", "x", [], {"a": 1}, 1, False, None)
+        q = m.build_query("Z", "x", [], {"a": 1}, 1, None)
         self.assertNotIn("dimensions", q)
         self.assertNotIn("orderBy", q)
         self.assertNotIn("avg", q)
@@ -925,12 +926,6 @@ class TestQueryGrouped(unittest.TestCase):
         self.assertIsNone(err)
         self.assertEqual(rows, [])
 
-    def test_sample_interval_fallback(self):
-        effects = [(None, [{"message": "no sampleInterval here"}]),
-                   ({"viewer": {"zones": [{"result": []}]}}, [])]
-        rows, err = self.run_grouped(effects, fields=("clientIP",))
-        self.assertIsNone(err)
-
     def test_hard_error(self):
         rows, err = self.run_grouped([(None, [{"message": "quota exceeded"}])])
         self.assertIsNone(rows)
@@ -953,7 +948,7 @@ class TestRendering(unittest.TestCase):
         with captured() as (out, _):
             m.print_table("T", ["clientIP"], self.rows(), 1000, 150)
         self.assertIn("192.0.2.0", out.getvalue())
-        self.assertIn("5.00%", out.getvalue())
+        self.assertIn("0.50%", out.getvalue())
 
     def test_print_table_empty_and_zero_total(self):
         with captured() as (out, _):
@@ -989,7 +984,7 @@ class TestWriteCsvs(unittest.TestCase):
             "meta": {"zone": "smithlabs.io"},
             "datasets": {
                 "http": {
-                    "total": {"samples": 10, "estimated_requests": 100},
+                    "total": {"requests": 100},
                     "timeseries": {"bucket": "hour", "field": "datetimeHour",
                                    "bucket_seconds": 3600, "error": None,
                                    "rows": [{"count": 1, "avg": {"sampleInterval": 10},
@@ -1011,7 +1006,7 @@ class TestWriteCsvs(unittest.TestCase):
             with open(os.path.join(td, "http_ip.csv")) as fh:
                 body = fh.read()
             self.assertIn("192.0.2.1", body)
-            self.assertIn("20", body)  # est_requests = 2 * 10
+            self.assertIn("1,192.0.2.1,2,", body)  # requests = count (2), no sampleInterval multiplier
 
     def test_errored_timeseries_not_written(self):
         results = {"meta": {},

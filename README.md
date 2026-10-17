@@ -36,8 +36,9 @@ Legacy global key also works: `--auth-email` / `--auth-key` or `CLOUDFLARE_EMAIL
 | `--dataset firewall` | `firewallEventsAdaptiveGroups` | Security → Events (mitigations) | asn, ip, ua, country, host, path, ja4, action, rule |
 | `--dataset both` (default) | both | both | all of the above |
 
-Both datasets are **sampled** — each row reports raw `samples` plus `est_requests`
-(samples × avg sampleInterval), which is what the dashboard shows. Percentages are
+Both datasets are **sampled** — each row reports a single `requests` figure: the
+`count` Cloudflare returns, which is already scaled to estimate total volume (no
+further multiplication by `sampleInterval`). Percentages are
 share of the whole filtered window.
 
 ### Dashboard "analysis tab" equivalents
@@ -272,7 +273,7 @@ surface the deprecation instead of hiding it. Concretely:
 ```sql
 -- JSON: one table per dimension
 SELECT d.dimensions.clientAsn, d.dimensions.clientASNDescription,
-       d.count AS samples, d.count * d.avg.sampleInterval AS est_requests
+       d.count AS requests
 FROM (
   SELECT unnest(datasets.http.dims.asn.rows) AS d
   FROM read_json_auto('band.json')

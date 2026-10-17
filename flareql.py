@@ -814,10 +814,8 @@ def translate_where_best_effort(node, dataset_key, asn_as_string):
 
 # ---------------------------------------------------------------- queries
 
-def build_query(zone_id, dataset_node, fields, flt, limit, include_avg, order_by):
+def build_query(zone_id, dataset_node, fields, flt, limit, order_by):
     sel = ["count"]
-    if include_avg:
-        sel.append("avg { sampleInterval }")
     if fields:
         sel.append("dimensions { " + " ".join(fields) + " }")
     order = f", orderBy: [{order_by}]" if order_by else ""
@@ -839,9 +837,8 @@ def query_grouped(headers, zone_id, dataset_node, fields, flt, limit, timeout, o
     field sets when the schema rejects an optional field (e.g. zones without a
     given field, or datasets lacking clientASNDescription/ja4)."""
     fields = list(fields) if fields else []
-    include_avg = True
     for _ in range(4):
-        q = build_query(zone_id, dataset_node, fields, flt, limit, include_avg, order_by if fields else None)
+        q = build_query(zone_id, dataset_node, fields, flt, limit, order_by if fields else None)
         data, errors = gql(headers, q, timeout)
         if not errors:
             rows = extract_rows(data)
@@ -852,19 +849,15 @@ def query_grouped(headers, zone_id, dataset_node, fields, flt, limit, timeout, o
         if "clientASNDescription" in msg and "clientASNDescription" in fields:
             fields.remove("clientASNDescription")
             continue
-        if "sampleInterval" in msg and include_avg:
-            include_avg = False
-            continue
         return None, msg
     return None, "gave up after repeated schema fallbacks"  # pragma: no cover — each fallback fires at most once
 
 
 def estimated_requests(row):
-    count = row.get("count", 0)
-    avg = (row.get("avg") or {}).get("sampleInterval")
-    if avg:
-        return int(round(count * avg))
-    return count
+    # On adaptive datasets `count` is already Cloudflare's scaled estimate of total
+    # events. Do NOT multiply by avg(sampleInterval) — that applies the sampling
+    # correction twice (issue #13).
+    return row.get("count", 0)
 
 
 # ---------------------------------------------------------------- --inspect (capability probing)
@@ -920,7 +913,7 @@ def inspect_dataset(headers, zone_id, ds_key, node, timeout):
     fmt = "%Y-%m-%dT%H:%M:%SZ"
     base_flt = {"datetime_geq": (now - timedelta(minutes=15)).strftime(fmt),
                 "datetime_leq": now.strftime(fmt)}
-    q = build_query(zone_id, node, [], base_flt, 1, False, None)
+    q = build_query(zone_id, node, [], base_flt, 1, None)
     data, errors = gql(headers, q, timeout)
     if errors:
         return "unavailable", set(), [], "; ".join(e.get("message", "") for e in errors)
@@ -935,7 +928,7 @@ def inspect_dataset(headers, zone_id, ds_key, node, timeout):
     candidates |= {gf for gf, _typ, dsets in WHERE_FIELDS.values() if ds_key in dsets}
     active, gated = set(candidates), []
     while True:
-        q = build_query(zone_id, node, sorted(active), base_flt, 1, False, None)
+        q = build_query(zone_id, node, sorted(active), base_flt, 1, None)
         data, errors = gql(headers, q, timeout)
         if not errors:
             return "ok", active, gated, None
@@ -1060,18 +1053,18 @@ def print_timeseries(bucket, tfield, tsecs, rows):
     if not rows:
         print("  (no data)")
         return
-    rates = [(r.get("dimensions", {}).get(tfield, ""), r.get("count", 0),
-              estimated_requests(r)) for r in rows]
-    peak = max(rates, key=lambda x: x[2])
-    avg_rps = sum(x[2] for x in rates) / (len(rates) * tsecs)
+    rates = [(r.get("dimensions", {}).get(tfield, ""), estimated_requests(r))
+             for r in rows]
+    peak = max(rates, key=lambda x: x[1])
+    avg_rps = sum(x[1] for x in rates) / (len(rates) * tsecs)
     print(f"  buckets: {len(rates)} | avg ~{avg_rps:,.1f} req/s | "
-          f"peak {peak[2]:,} reqs ({peak[2] / tsecs:,.1f} req/s) at {peak[0]}")
+          f"peak {peak[1]:,} reqs ({peak[1] / tsecs:,.1f} req/s) at {peak[0]}")
     if len(rates) > 96:
         print(f"  (too many buckets to print — full series in --out output)")
         return
-    width = max(len(f"{est:,}") for _, _, est in rates)
-    max_est = peak[2] or 1
-    for ts, samples, est in rates:
+    width = max(len(f"{est:,}") for _, est in rates)
+    max_est = peak[1] or 1
+    for ts, est in rates:
         bar = "#" * max(1, int(40 * est / max_est)) if est else ""
         print(f"  {ts}  {est:>{width},}  {bar}")
 
@@ -1081,14 +1074,14 @@ def print_table(title, fields, rows, total_est, limit):
     if not rows:
         print("  (no data)")
         return
-    headers = fields + ["samples", "est_requests", "pct"]
+    headers = fields + ["requests", "pct"]
     table = []
     for i, r in enumerate(rows, 1):
         dims = r.get("dimensions") or {}
         est = estimated_requests(r)
         pct = f"{100.0 * est / total_est:.2f}%" if total_est else "-"
         table.append([str(i)] + [truncate(f, dims.get(f, "")) for f in fields]
-                     + [f"{r.get('count', 0):,}", f"{est:,}", pct])
+                     + [f"{est:,}", pct])
     headers = ["#"] + headers
     widths = [max(len(h), *(len(row[i]) for row in table)) for i, h in enumerate(headers)]
     print("  " + "  ".join(h.ljust(widths[i]) for i, h in enumerate(headers)))
@@ -1105,11 +1098,10 @@ def write_csvs(outdir, results):
             path = os.path.join(outdir, f"{ds_key}_timeseries.csv")
             with open(path, "w", newline="") as fh:
                 w = csv.writer(fh)
-                w.writerow(["time", "samples", "est_requests", "req_per_sec"])
+                w.writerow(["time", "requests", "req_per_sec"])
                 for r in ts["rows"]:
                     est = estimated_requests(r)
-                    w.writerow([r.get("dimensions", {}).get(ts["field"], ""),
-                                r.get("count", 0), est,
+                    w.writerow([r.get("dimensions", {}).get(ts["field"], ""), est,
                                 round(est / ts["bucket_seconds"], 3)])
             written.append(path)
         for dim_key, dim in ds["dims"].items():
@@ -1117,16 +1109,16 @@ def write_csvs(outdir, results):
                 continue
             path = os.path.join(outdir, f"{ds_key}_{dim_key}.csv")
             fields = dim["fields"]
-            total_est = ds.get("total", {}).get("estimated_requests") or 0
+            total_est = ds.get("total", {}).get("requests") or 0
             with open(path, "w", newline="") as fh:
                 w = csv.writer(fh)
-                w.writerow(["rank"] + fields + ["samples", "est_requests", "pct_of_window"])
+                w.writerow(["rank"] + fields + ["requests", "pct_of_window"])
                 for i, r in enumerate(dim["rows"], 1):
                     dims = r.get("dimensions") or {}
                     est = estimated_requests(r)
                     pct = round(100.0 * est / total_est, 4) if total_est else ""
                     w.writerow([i] + [dims.get(f, "") for f in fields]
-                               + [r.get("count", 0), est, pct])
+                               + [est, pct])
             written.append(path)
     meta_path = os.path.join(outdir, "meta.json")
     with open(meta_path, "w") as fh:
@@ -1318,7 +1310,7 @@ def main():
             "filters": active_filters,
             "limit": args.limit,
             "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "note": "adaptive datasets are SAMPLED; est_requests = samples x avg sampleInterval",
+            "note": "adaptive datasets are SAMPLED; Cloudflare's count is already a scaled estimate of total requests, reported here as requests (no further multiplication)",
         },
         "datasets": {},
     }
@@ -1362,8 +1354,7 @@ def main():
         total_est = estimated_requests(total_row) if rows else 0
         ds_result = {
             "total": {
-                "samples": total_row.get("count", 0),
-                "estimated_requests": total_est,
+                "requests": total_est,
             },
             "dims": {},
         }
@@ -1373,8 +1364,7 @@ def main():
             print(f"\n=== {zone_name} | {label} | {since} -> {until} ===")
             if active_filters:
                 print(f"Filters: {json.dumps(active_filters)}")
-            print(f"Window total: {total_row.get('count', 0):,} samples "
-                  f"~= {total_est:,} requests")
+            print(f"Window total: {total_est:,} requests (estimated)")
 
         if args.timeseries:
             tfield, tsecs = TIMESERIES_BUCKETS[args.timeseries]
