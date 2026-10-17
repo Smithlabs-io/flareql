@@ -74,6 +74,7 @@ HTTP_DIMS = {
     "ja4": (["ja4"], "Top JA4 fingerprints"),
     "botscore": (["botScore"], "Bot score distribution"),
     "status": (["edgeResponseStatus"], "Edge response status codes"),
+    "content": (["edgeResponseContentTypeName"], "Content types served"),
     # dashboard "Bot analysis" tab
     "botsrc": (["botScoreSrcName"], "Bot score sources"),
     # dashboard "Attack analysis" tab
@@ -173,7 +174,16 @@ def http_json(url, headers, body=None, timeout=60, max_tries=4):
     die(f"exhausted retries: {last_err}")  # pragma: no cover — loop always returns or dies
 
 
+_verbose = False
+
+
+def vprint(msg, **kw):
+    if _verbose:
+        print(msg, file=sys.stderr, **kw)
+
+
 def gql(headers, query, timeout):
+    vprint(f"[gql] {query[:600]}{'…' if len(query) > 600 else ''}")
     payload = http_json(GRAPHQL_URL, headers, body={"query": query}, timeout=timeout)
     return payload.get("data"), payload.get("errors") or []
 
@@ -312,19 +322,38 @@ WHERE_FIELDS = {
     "ja4":      ("ja4", "str", ("http", "firewall")),
     "botscore": ("botScore", "int", ("http",)),
     "status":   ("edgeResponseStatus", "int", ("http",)),
+    # analytics-only bucket ("html", "javascript", "image"...) — no wirefilter field
+    # produces this; the closest real WAF-rule field, http.response.content_type.media_type,
+    # is the full MIME type and isn't stored in this dataset. See README "wirefilter vs
+    # GraphQL fields".
+    "content":  ("edgeResponseContentTypeName", "str", ("http",)),
     "method":   ("clientRequestHTTPMethodName", "str", ("http",)),
     "botsrc":   ("botScoreSrcName", "str", ("http",)),
     "attackscore": ("wafAttackScore", "int", ("http",)),
+    "attackclass": ("wafAttackScoreClass", "str", ("http",)),
     "sqli":     ("wafSqliAttackScore", "int", ("http",)),
     "xss":      ("wafXssAttackScore", "int", ("http",)),
     "rce":      ("wafRceAttackScore", "int", ("http",)),
     "securityaction": ("securityAction", "str", ("http",)),
     "cache":    ("cacheStatus", "str", ("http",)),
+    # boolean in wirefilter, but the GraphQL API has no boolean verifiedBot argument:
+    # it exposes verifiedBotCategory, a string that is "" when the request is not a verified bot
+    "verifiedbot": ("verifiedBotCategory", "bool", ("http",)),
     "action":   ("action", "str", ("firewall",)),
     "ruleid":   ("ruleId", "str", ("firewall",)),
 }
 
+# boolean wirefilter fields backed by a GraphQL string that is "" when false
+BOOL_AS_NONEMPTY_STR = {"verifiedbot"}
+
 # wirefilter names (as used in WAF rule expressions) -> canonical
+#
+# ip.geoip.asnum / ip.geoip.country are Cloudflare's legacy spellings: the current field
+# reference documents them as deprecated in favor of ip.src.*, but still accepts them with
+# no removal date announced (checked https://developers.cloudflare.com/deprecations —
+# no entry for these fields as of this writing). We accept both for as long as Cloudflare
+# does; LEGACY_WIREFILTER_FIELDS below drives a one-time runtime notice pointing at the
+# current spelling, so this stays visible without holding up any actual query.
 WHERE_ALIASES = {
     "ip.geoip.asnum": "asn", "ip.src.asnum": "asn",
     "ip.geoip.country": "country", "ip.src.country": "country",
@@ -337,11 +366,53 @@ WHERE_ALIASES = {
     "http.response.code": "status",
     "http.request.method": "method",
     "cf.waf.score": "attackscore", "waf.score": "attackscore",
+    "cf.waf.score.class": "attackclass",
     "cf.waf.score.sqli": "sqli", "cf.waf.score.xss": "xss", "cf.waf.score.rce": "rce",
+    "cf.bot_management.verified_bot": "verifiedbot",
+    "cf.verified_bot": "verifiedbot",
 }
+
+# legacy spelling -> current spelling, per Cloudflare's own field reference. No sunset/removal
+# date is published (see the WHERE_ALIASES comment above) — re-check
+# https://developers.cloudflare.com/deprecations before assuming that stays true.
+LEGACY_WIREFILTER_FIELDS = {
+    "ip.geoip.asnum": "ip.src.asnum",
+    "ip.geoip.country": "ip.src.country",
+}
+
+
+def warn_legacy_where_fields(node):
+    """Emit one stderr notice per distinct Cloudflare-deprecated wirefilter spelling used
+    in a --where expression, pointing at the current replacement. Mirrors the standard
+    runtime-deprecation-warning pattern (cf. Python's DeprecationWarning) since this tool
+    has no library API to attach warnings to — stderr at parse time is the CLI equivalent."""
+    seen = set()
+
+    def walk(n):
+        kind = n[0]
+        if kind == "cmp":
+            field = n[1].lower()
+            if field in LEGACY_WIREFILTER_FIELDS and field not in seen:
+                seen.add(field)
+                warn(f"--where: '{field}' is a Cloudflare-deprecated wirefilter spelling "
+                     f"(no removal date announced) — prefer '{LEGACY_WIREFILTER_FIELDS[field]}'")
+        elif kind == "not":
+            walk(n[1])
+        elif kind in ("and", "or"):
+            for child in n[1]:
+                walk(child)
+
+    walk(node)
 
 KEYWORDS = {"and", "or", "not", "in", "eq", "ne", "lt", "le", "gt", "ge",
             "contains", "matches", "wildcard", "starts_with", "ends_with"}
+
+# wirefilter functions that have no Analytics GraphQL equivalent — detected by name so we
+# can parse them into prunable AST nodes instead of hard-failing at parse time.
+_WIREFILTER_UNSUPPORTED_FUNCS = frozenset({
+    "len", "any", "all", "concat", "lower", "upper",
+    "url_decode", "regex_replace", "to_string", "ip_is_private",
+})
 
 OP_NORMALIZE = {"eq": "eq", "==": "eq", "ne": "neq", "!=": "neq",
                 "lt": "lt", "<": "lt", "le": "leq", "<=": "leq",
@@ -358,6 +429,7 @@ OP_NEGATE = {"eq": "neq", "neq": "eq", "lt": "geq", "geq": "lt",
 
 _WHERE_TOKEN = re.compile(r"""
     (?P<lparen>\() | (?P<rparen>\)) |
+    (?P<lbracket>\[) | (?P<rbracket>\]) |
     (?P<lbrace>\{) | (?P<rbrace>\}) |
     (?P<comma>,) |
     (?P<op>==|!=|<=|>=|<|>) |
@@ -426,6 +498,40 @@ class WhereParser:
             parts.append(self.parse_unary())
         return parts[0] if len(parts) == 1 else ("and", parts)
 
+    def _consume_paren_group(self):
+        """Consume a balanced (...) group, starting after the opening lparen."""
+        self.advance()  # consume (
+        depth = 1
+        while depth > 0:
+            kind, _ = self.advance()
+            if kind is None:
+                raise ExprError("unclosed '(' in function call")
+            if kind == "lparen":
+                depth += 1
+            elif kind == "rparen":
+                depth -= 1
+
+    def _consume_bracket_as_str(self):
+        """Consume one [...] and return it as a display string (e.g. '[\"key\"]', '[*]')."""
+        self.advance()  # consume [
+        parts, depth = [], 1
+        while depth > 0:
+            kind, val = self.advance()
+            if kind is None:
+                raise ExprError("unclosed '[' in field access")
+            if kind == "lbracket":
+                depth += 1
+                parts.append("[")
+            elif kind == "rbracket":
+                depth -= 1
+                if depth > 0:
+                    parts.append("]")
+            elif kind == "value":
+                parts.append(f'"{val}"')
+            else:
+                parts.append(str(val))
+        return "[" + "".join(parts) + "]"
+
     def parse_unary(self):
         kind, val = self.peek()
         if (kind, val) == ("kw", "not"):
@@ -437,12 +543,67 @@ class WhereParser:
             if self.advance()[0] != "rparen":
                 raise ExprError("missing closing ')'")
             return node
+        # function-call form: starts_with(field, value) / ends_with(field, value)
+        if kind == "kw" and val in ("starts_with", "ends_with"):
+            self.advance()
+            if self.peek()[0] != "lparen":
+                raise ExprError(
+                    f"'{val}' used as a function requires '(' — "
+                    f"or use infix form: field {val} value"
+                )
+            self.advance()  # consume (
+            fkind, field = self.advance()
+            if fkind != "word":
+                raise ExprError(f"expected a field name as first argument to {val}()")
+            if self.advance()[0] != "comma":
+                raise ExprError(f"expected ',' after field name in {val}(field, value)")
+            vkind, value = self.advance()
+            if vkind not in ("word", "value"):
+                raise ExprError(f"expected a string value as second argument to {val}()")
+            if self.advance()[0] != "rparen":
+                raise ExprError(f"expected ')' to close {val}()")
+            op = "starts" if val == "starts_with" else "ends"
+            return ("cmp", field, op, [value])
         return self.parse_cmp()
 
     def parse_cmp(self):
         kind, field = self.advance()
+        # wirefilter functions with no Analytics equivalent: any(...), len(...), etc.
+        # Consume the full expression into an unsupported_func node so --best-effort can prune it.
+        if kind == "word" and field.lower() in _WIREFILTER_UNSUPPORTED_FUNCS:
+            if self.peek()[0] == "lparen":
+                self._consume_paren_group()
+                # consume optional trailing operator + value/list
+                nk, nv = self.peek()
+                if nk == "op" or (nk == "kw" and nv in OP_NORMALIZE):
+                    self.advance()
+                    if self.peek()[0] in ("value", "word"):
+                        self.advance()
+                    elif self.peek()[0] in ("lbrace", "lparen"):
+                        opener = self.peek()[0]
+                        closer = "rbrace" if opener == "lbrace" else "rparen"
+                        self.advance()
+                        while self.peek()[0] not in (closer, None):
+                            self.advance()
+                        if self.peek()[0] == closer:
+                            self.advance()
+                return ("unsupported_func", field)
         if kind != "word":
             raise ExprError(f"expected a field name, got {field!r}")
+        # bracket access: http.request.headers["key"][*] — consume into field name string
+        while self.peek()[0] == "lbracket":
+            field += self._consume_bracket_as_str()
+        # standalone boolean: cf.bot_management.verified_bot (no operator follows)
+        # wirefilter allows bare boolean fields as truthy checks — de-sugar to `field eq true`
+        next_kind, next_val = self.peek()
+        is_operator = (next_kind == "op") or (next_kind == "kw" and next_val in OP_NORMALIZE)
+        if not is_operator:
+            try:
+                canon = resolve_where_field(field)
+                if WHERE_FIELDS[canon][1] == "bool":
+                    return ("cmp", field, "eq", ["true"])
+            except ExprError:
+                pass
         kind, op = self.advance()
         if kind == "op" or (kind == "kw" and op in OP_NORMALIZE):
             op = OP_NORMALIZE[op]
@@ -478,11 +639,31 @@ class WhereParser:
 
 def resolve_where_field(name):
     key = name.lower()
+    if "[" in key:
+        raise ExprError(
+            f"'{name}' uses bracket/array access — individual request headers and "
+            "array fields are not stored in the Analytics dataset (only clientIP, "
+            "clientRequestPath, userAgent, botScore, and similar aggregated dimensions)"
+        )
     key = WHERE_ALIASES.get(key, key)
     if key not in WHERE_FIELDS:
         known = ", ".join(sorted(set(WHERE_FIELDS) | set(WHERE_ALIASES)))
         raise ExprError(f"unknown field '{name}' — known fields: {known}")
     return key
+
+
+def _ast_to_str(node):
+    kind = node[0]
+    if kind == "cmp":
+        _, field, op, values = node
+        val = values[0] if len(values) == 1 else "{" + " ".join(str(v) for v in values) + "}"
+        return f"{field} {op} {val!r}"
+    if kind == "unsupported_func":
+        return f"{node[1]}(...)"
+    if kind == "not":
+        return f"not ({_ast_to_str(node[1])})"
+    sep = f" {kind} "
+    return "(" + sep.join(_ast_to_str(c) for c in node[1]) + ")"
 
 
 def where_cmp_to_filter(field, op, values, dataset_key, asn_as_string):
@@ -493,9 +674,17 @@ def where_cmp_to_filter(field, op, values, dataset_key, asn_as_string):
         if dataset_key == "firewall":
             hint = (" (firewall events carry no bot/attack scores — the http dataset's "
                     "'security' dim shows mitigation outcomes for scored traffic instead)")
+        if canon in BOOL_AS_NONEMPTY_STR:
+            hint = " (firewall events have no verified-bot field; use --dataset http)"
         raise ExprError(f"field '{field}' doesn't exist on the {dataset_key} dataset{hint}")
 
     def coerce(v):
+        if typ == "bool":
+            if str(v).lower() in ("true", "1"):
+                return True
+            if str(v).lower() in ("false", "0"):
+                return False
+            raise ExprError(f"'{field}' is a boolean field — use 'true' or 'false', got {v!r}")
         if typ == "asn":
             v = re.sub(r"(?i)^as", "", str(v))
             if not v.isdigit():
@@ -508,12 +697,33 @@ def where_cmp_to_filter(field, op, values, dataset_key, asn_as_string):
                 raise ExprError(f"'{field}' expects a number, got {v!r}")
         return str(v)
 
+    if canon in BOOL_AS_NONEMPTY_STR:
+        # eq true / ne false -> category != "" ; eq false / ne true -> category == ""
+        if op not in ("eq", "neq"):
+            raise ExprError(f"'{field}' is boolean — only eq/ne with true or false is supported")
+        if coerce(values[0]) == (op == "eq"):
+            return {f"{gql_field}_neq": ""}
+        return {gql_field: ""}
+
     if op in ("in", "notin"):
-        return {f"{gql_field}_{'in' if op == 'in' else 'notin'}": [coerce(v) for v in values]}
+        coerced = [coerce(v) for v in values]
+        if typ == "str":
+            cidr_vals = [str(v) for v in values if re.search(r"/\d{1,2}$", str(v))]
+            if cidr_vals:
+                warn(
+                    f"--where: '{field} in {{...}}' contains CIDR notation "
+                    f"({', '.join(cidr_vals[:3])}{'...' if len(cidr_vals) > 3 else ''}) — "
+                    "the Analytics API matches exact IPs only; CIDR blocks will be passed "
+                    "as literal strings and will match nothing"
+                )
+        return {f"{gql_field}_{'in' if op == 'in' else 'notin'}": coerced}
     v = values[0]
     if op == "eq":
         return {gql_field: coerce(v)}
     if op == "neq":
+        # boolean fields: flip the value instead of using _neq (API doesn't support it for bools)
+        if typ == "bool":
+            return {gql_field: not coerce(v)}
         return {f"{gql_field}_neq": coerce(v)}
     if op in ("lt", "leq", "gt", "geq"):
         if typ == "str":
@@ -533,6 +743,11 @@ def where_cmp_to_filter(field, op, values, dataset_key, asn_as_string):
 
 def translate_where(node, dataset_key, asn_as_string, negate=False):
     kind = node[0]
+    if kind == "unsupported_func":
+        raise ExprError(
+            f"'{node[1]}()' is a wirefilter function with no Analytics API equivalent — "
+            "use --best-effort to run with this clause pruned"
+        )
     if kind == "not":
         return translate_where(node[1], dataset_key, asn_as_string, not negate)
     if kind in ("and", "or"):
@@ -544,6 +759,57 @@ def translate_where(node, dataset_key, asn_as_string, negate=False):
     if negate:
         op = OP_NEGATE[op]
     return where_cmp_to_filter(field, op, values, dataset_key, asn_as_string)
+
+
+def translate_where_best_effort(node, dataset_key, asn_as_string):
+    """Like translate_where but prunes untranslatable clauses instead of raising.
+
+    Returns (filter_or_None, pruned) where pruned is a list of dicts:
+      {"clause": str, "reason": str, "effect": "superset"|"subset"|"none"}
+
+    effect describes how pruning distorts the result:
+      "superset" — clause removed from AND; result matches MORE traffic than intended
+      "subset"   — clause removed from OR;  result matches LESS traffic than intended
+      "none"     — entire expression pruned; no where filter applied
+    """
+    pruned = []
+
+    def _t(node, negate, parent_logical):
+        kind = node[0]
+        if kind == "unsupported_func":
+            raise ExprError(
+                f"'{node[1]}()' is a wirefilter function with no Analytics API equivalent — "
+                "the API cannot filter on computed values, array operations, or header contents"
+            )
+        if kind == "not":
+            return _t(node[1], not negate, parent_logical)
+        if kind in ("and", "or"):
+            effective = ("or" if kind == "and" else "and") if negate else kind
+            children = []
+            for child in node[1]:
+                try:
+                    result = _t(child, negate, effective)
+                    if result is not None:
+                        children.append(result)
+                except ExprError as e:
+                    effect = "superset" if effective == "and" else "subset"
+                    pruned.append({"clause": _ast_to_str(child), "reason": str(e),
+                                   "effect": effect})
+            if not children:
+                return None
+            return children[0] if len(children) == 1 else {effective.upper(): children}
+        _, field, op, values = node
+        if negate:
+            op = OP_NEGATE[op]
+        return where_cmp_to_filter(field, op, values, dataset_key, asn_as_string)
+
+    try:
+        result = _t(node, False, None)
+    except ExprError as e:
+        pruned.append({"clause": _ast_to_str(node), "reason": str(e), "effect": "none"})
+        result = None
+
+    return result, pruned
 
 
 # ---------------------------------------------------------------- queries
@@ -916,13 +1182,26 @@ def parse_args():
                         "Supports and/or/not, parens, eq ne lt le gt ge == != < <= > >=, "
                         "in {a b c}, contains, wildcard, starts_with, ends_with. "
                         "Fields: asn, country, ip, host, path, ua, ja4, botscore, status, "
-                        "method (http) / action, ruleid (firewall) — or wirefilter names "
-                        "like ip.geoip.asnum, cf.bot_management.score. Example: "
-                        "\"asn in {64496 64497} or (botscore lt 30 and country eq RU)\"")
+                        "content, method (http) / action, ruleid (firewall) — or wirefilter "
+                        "names like ip.geoip.asnum, cf.bot_management.score, where one exists "
+                        "(not every accepted field name is real wirefilter — see README). "
+                        "Example: \"status eq 200 and content eq html\"")
     # output
     p.add_argument("--out", help="write results to this path (json file, or directory for csv)")
     p.add_argument("--format", choices=["json", "csv"], default="json",
                    help="output format for --out (default json)")
+    p.add_argument("-v", "--verbose", action="store_true",
+                   help="Print --where translation (AST, filter object, pruned clauses) and "
+                        "each GraphQL query to stderr before sending. Combine with --dry-run "
+                        "to inspect without making any API calls.")
+    p.add_argument("--dry-run", action="store_true",
+                   help="Parse and translate --where, print verbose output, then exit "
+                        "without making any API calls. Implies --verbose.")
+    p.add_argument("--best-effort", action="store_true",
+                   help="When --where contains clauses the Analytics API cannot express "
+                        "(header access, regex, unsupported functions), prune them and "
+                        "continue with the remaining expression instead of exiting. "
+                        "Pruned clauses are reported in stderr and in JSON output.")
     p.add_argument("--quiet", action="store_true", help="suppress console tables")
     p.add_argument("--timeout", type=int, default=60, help="per-request timeout seconds")
     return p.parse_args()
@@ -930,6 +1209,39 @@ def parse_args():
 
 def main():
     args = parse_args()
+    global _verbose
+    _verbose = args.verbose or args.dry_run
+
+    if args.dry_run:
+        since, until = parse_window(args)
+        dataset_keys = ["http", "firewall"] if args.dataset == "both" else [args.dataset]
+        where_ast = None
+        if args.where:
+            try:
+                where_ast = WhereParser(tokenize_where(args.where)).parse()
+            except ExprError as e:
+                die(f"--where: {e}")
+            warn_legacy_where_fields(where_ast)
+        print(f"[dry-run] window  : {since} → {until}")
+        print(f"[dry-run] datasets: {', '.join(dataset_keys)}")
+        if where_ast:
+            print(f"[dry-run] --where : {args.where}")
+            print(f"[dry-run] AST     : {_ast_to_str(where_ast)}")
+            for ds_key in dataset_keys:
+                asn_as_string = ds_key == "firewall"
+                if args.best_effort:
+                    flt, pruned = translate_where_best_effort(where_ast, ds_key, asn_as_string)
+                    print(f"[dry-run] [{ds_key}] filter (best-effort): {json.dumps(flt)}")
+                    for p in pruned:
+                        print(f"[dry-run] [{ds_key}] pruned ({p['effect']}): {p['clause']!r}")
+                else:
+                    try:
+                        flt = translate_where(where_ast, ds_key, asn_as_string)
+                        print(f"[dry-run] [{ds_key}] filter: {json.dumps(flt)}")
+                    except ExprError as e:
+                        print(f"[dry-run] [{ds_key}] error: {e}")
+        return
+
     headers = build_headers(args)
     zone_id, zone_name, zone_plan = resolve_zone(headers, args.zone, args.timeout)
 
@@ -971,12 +1283,32 @@ def main():
             where_ast = WhereParser(tokenize_where(args.where)).parse()
         except ExprError as e:
             die(f"--where: {e}")
+        warn_legacy_where_fields(where_ast)
+        vprint(f"[where] expression : {args.where}")
+        vprint(f"[where] AST        : {_ast_to_str(where_ast)}")
+
+    all_pruned = {}
+    where_skipped = []
 
     def make_filter(ds_key, asn_as_string):
         flt = build_filter(args, ds_key, since, until, asn_as_string)
-        if where_ast is not None:
-            flt = {"AND": [flt, translate_where(where_ast, ds_key, asn_as_string)]}
-        return flt
+        if where_ast is None:
+            return flt
+        if args.best_effort:
+            where_flt, pruned = translate_where_best_effort(where_ast, ds_key, asn_as_string)
+            if pruned:
+                all_pruned[ds_key] = pruned
+                for p in pruned:
+                    warn(f"[{ds_key}] --where: pruned clause ({p['effect']}) — "
+                         f"{p['reason']}: {p['clause']!r}")
+            if where_flt is None:
+                vprint(f"[where] [{ds_key}] entire expression pruned — no where filter applied")
+                return flt
+            vprint(f"[where] [{ds_key}] translated (best-effort): {json.dumps(where_flt)}")
+            return {"AND": [flt, where_flt]}
+        where_flt = translate_where(where_ast, ds_key, asn_as_string)
+        vprint(f"[where] [{ds_key}] translated: {json.dumps(where_flt)}")
+        return {"AND": [flt, where_flt]}
 
     results = {
         "meta": {
@@ -1014,6 +1346,7 @@ def main():
         except ExprError as e:
             warn(f"[{ds_key}] --where: {e} — skipping this dataset")
             results["datasets"][ds_key] = {"total": {"error": str(e)}, "dims": {}}
+            where_skipped.append(ds_key)
             continue
         rows, err = query_grouped(headers, zone_id, node, [], flt, 1, args.timeout)
         if err and "clientAsn" in err:
@@ -1075,6 +1408,13 @@ def main():
                 print_table(title, fields, rows, total_est, args.limit)
 
         results["datasets"][ds_key] = ds_result
+
+    if where_skipped and len(where_skipped) == len(dataset_keys):
+        die("--where could not be applied to any selected dataset "
+            f"({', '.join(where_skipped)}) — no data was queried and no output was written")
+
+    if all_pruned:
+        results["meta"]["pruned_clauses"] = all_pruned
 
     if args.out:
         if args.format == "csv":
